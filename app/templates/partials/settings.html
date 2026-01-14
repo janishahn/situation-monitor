@@ -1,0 +1,58 @@
+<form
+  class="space-y-5"
+  hx-post="/settings"
+  hx-target="#modal-content"
+  hx-swap="innerHTML"
+>
+  <div class="grid grid-cols-2 gap-3">
+    <label class="flex items-start gap-2 rounded border border-slate-800 bg-slate-900 p-2">
+      <input
+        type="checkbox"
+        name="polling_enabled"
+        class="mt-1"
+        {% if polling_enabled %}checked{% endif %}
+      />
+      <div>
+        <div class="text-sm text-slate-200">Polling</div>
+        <div class="text-xs text-slate-400">Enable source polling</div>
+      </div>
+    </label>
+
+    <div class="rounded border border-slate-800 bg-slate-900 p-2">
+      <div class="text-sm text-slate-200">Map tiles</div>
+      <input
+        name="map_tile_url"
+        value="{{ map_tile_url }}"
+        class="mt-1 w-full rounded bg-slate-950 px-2 py-1 text-xs text-slate-200 outline-none"
+      />
+      <div class="mt-1 text-[11px] text-slate-400">Refresh page to reload tiles.</div>
+    </div>
+  </div>
+
+  <div>
+    <div class="text-sm font-semibold text-slate-200">Feed packs</div>
+    <div class="mt-2 grid grid-cols-2 gap-3">
+      {% for pack in packs %}
+      <label class="flex items-start gap-2 rounded border border-slate-800 bg-slate-900 p-2">
+        <input
+          type="checkbox"
+          name="pack_{{ pack.pack_id }}"
+          class="mt-1"
+          {% if pack.enabled %}checked{% endif %}
+        />
+        <div>
+          <div class="text-sm text-slate-200">{{ pack.pack_id }}</div>
+          <div class="text-xs text-slate-400">{{ pack.source_count }} sources</div>
+        </div>
+      </label>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="flex items-center justify-end gap-2">
+    <button type="button" class="rounded bg-slate-800 px-3 py-1 text-sm hover:bg-slate-700" onclick="document.getElementById('modal').classList.add('hidden')">
+      Close
+    </button>
+    <button type="submit" class="rounded bg-blue-600 px-3 py-1 text-sm hover:bg-blue-500">Save</button>
+  </div>
+</form>

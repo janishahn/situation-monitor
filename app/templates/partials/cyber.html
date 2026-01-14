@@ -1,0 +1,32 @@
+<div class="p-3">
+  <div class="mb-2 flex items-center justify-between text-xs text-slate-400">
+    <div>{{ incidents|length }} items</div>
+    <div>Cyber</div>
+  </div>
+  <div class="space-y-2">
+    {% for inc in incidents %}
+    <a
+      class="block rounded border border-slate-800 bg-slate-900/60 p-3 hover:bg-slate-900"
+      hx-get="/partials/incident/{{ inc.incident_id }}"
+      hx-target="#incident-detail"
+      hx-swap="innerHTML"
+      hx-on:click="document.getElementById('incident-detail').dataset.incidentId='{{ inc.incident_id }}'"
+    >
+      <div class="flex items-start justify-between gap-2">
+        <div class="min-w-0">
+          <div class="truncate text-sm font-semibold">{{ inc.title }}</div>
+          <div class="mt-0.5 truncate text-xs text-slate-400">{{ inc.summary }}</div>
+        </div>
+        <div class="shrink-0 text-right text-xs text-slate-300">
+          <div class="rounded bg-slate-800 px-2 py-0.5">{{ inc.category }}</div>
+          <div class="mt-1">sev {{ inc.severity_score }}</div>
+        </div>
+      </div>
+      <div class="mt-2 flex items-center justify-between text-xs text-slate-400">
+        <div>{{ inc.last_seen_at | eu_datetime }}</div>
+        <div>{{ inc.source_count }} src • {{ inc.item_count }} items</div>
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+</div>

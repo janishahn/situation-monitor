@@ -1,2 +1,23 @@
-<div class="p-4 text-sm text-slate-400">Timeline histogram placeholder (Phase 2).</div>
+<div class="p-3">
+  <div class="flex items-center justify-between">
+    <div class="text-sm font-semibold text-slate-200">Timeline</div>
+    <div class="text-xs text-slate-400">{{ window }}</div>
+  </div>
 
+  <div class="mt-2 overflow-x-auto">
+    <div class="flex h-16 min-w-max items-end gap-[2px]">
+      {% for b in buckets %}
+      {% set h = 0 %}
+      {% if max_count > 0 %}
+      {% set h = (b.count / max_count * 100) %}
+      {% endif %}
+      <div class="w-[3px] rounded-sm bg-slate-700/70" style="height: {{ h }}%"></div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="mt-2 flex items-center justify-between text-[11px] text-slate-500">
+    <div>{{ since_iso | eu_datetime }}</div>
+    <div>{{ until_iso | eu_datetime }}</div>
+  </div>
+</div>

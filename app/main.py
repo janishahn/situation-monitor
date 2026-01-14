@@ -12,6 +12,7 @@ from fastapi.templating import Jinja2Templates
 
 from app.settings import Settings
 from geo.gazetteer import seed_country_places, suggest_places
+from ingest.feed_packs import load_feed_pack_entries
 from ingest.scheduler import run_scheduler
 from realtime.bus import EventBus
 from realtime.sse import router as sse_router
@@ -98,11 +99,19 @@ templates.env.filters["eu_datetime"] = _format_eu_datetime
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
     settings: Settings = request.app.state.settings
+    db: Database = request.app.state.db
+    map_tile_url = settings.map_tile_url
+    with db.lock:
+        row = db.conn.execute(
+            "SELECT value FROM app_config WHERE key = 'map_tile_url' LIMIT 1;"
+        ).fetchone()
+        if row is not None:
+            map_tile_url = str(row["value"])
     return templates.TemplateResponse(
         request=request,
         name="index.html",
         context={
-            "map_tile_url": settings.map_tile_url,
+            "map_tile_url": map_tile_url,
             "now_iso": _utc_now_iso(),
         },
     )
@@ -113,72 +122,107 @@ def _query_incidents(
     *,
     since_iso: str,
     until_iso: str,
+    asof_iso: str | None,
     categories: list[str],
     bbox: tuple[float, float, float, float] | None,
     q: str | None,
     min_severity: int | None,
     limit: int = 300,
 ) -> list[dict]:
-    where = ["last_seen_at >= ?", "last_seen_at <= ?"]
-    params: list[object] = [since_iso, until_iso]
+    params: list[object] = []
+
+    if asof_iso is None:
+        where = ["inc.last_seen_at >= ?", "inc.last_seen_at <= ?"]
+        params = [since_iso, until_iso]
+    else:
+        where = ["i.published_at >= ?", "i.published_at <= ?"]
+        params = [since_iso, asof_iso]
 
     if categories:
-        where.append(f"category IN ({','.join('?' for _ in categories)})")
+        where.append(f"inc.category IN ({','.join('?' for _ in categories)})")
         params.extend(categories)
+    else:
+        where.append("inc.category NOT IN ('cyber_cve','cyber_kev')")
 
     if min_severity is not None:
-        where.append("severity_score >= ?")
+        where.append("inc.severity_score >= ?")
         params.append(min_severity)
 
     if bbox is not None:
         minlon, minlat, maxlon, maxlat = bbox
-        where.append("lon IS NOT NULL AND lat IS NOT NULL")
-        where.append("lon >= ? AND lon <= ? AND lat >= ? AND lat <= ?")
+        where.append("inc.lon IS NOT NULL AND inc.lat IS NOT NULL")
+        where.append("inc.lon >= ? AND inc.lon <= ? AND inc.lat >= ? AND inc.lat <= ?")
         params.extend([minlon, maxlon, minlat, maxlat])
 
     joins = ""
     if q:
-        joins = "JOIN incidents_fts fts ON fts.rowid = incidents.rowid"
+        joins = "JOIN incidents_fts fts ON fts.rowid = inc.rowid"
         where.append("fts MATCH ?")
         params.append(q)
 
-    sql = f"""
-        SELECT incident_id, title, summary, category, first_seen_at, last_seen_at, last_item_at,
-               status, severity_score, lat, lon, bbox, location_confidence, location_rationale,
-               source_count, item_count, geom_geojson
-        FROM incidents
-        {joins}
-        WHERE {" AND ".join(where)}
-        ORDER BY last_seen_at DESC, source_count DESC, severity_score DESC
-        LIMIT ?;
-    """
-    params.append(limit)
+    if asof_iso is None:
+        sql = f"""
+            SELECT incident_id, title, summary, category, first_seen_at, last_seen_at, last_item_at,
+                   status, severity_score, lat, lon, bbox, location_confidence, location_rationale,
+                   source_count, item_count, geom_geojson
+            FROM incidents inc
+            {joins}
+            WHERE {" AND ".join(where)}
+            ORDER BY inc.last_seen_at DESC, source_count DESC, severity_score DESC
+            LIMIT ?;
+        """
+        params.append(limit)
+    else:
+        sql = f"""
+            SELECT inc.incident_id, inc.title, inc.summary, inc.category,
+                   inc.first_seen_at, MAX(i.published_at) AS last_item_at,
+                   inc.status, inc.severity_score, inc.lat, inc.lon, inc.bbox,
+                   inc.location_confidence, inc.location_rationale, inc.geom_geojson,
+                   COUNT(DISTINCT i.source_id) AS source_count,
+                   COUNT(DISTINCT i.item_id) AS item_count
+            FROM incidents inc
+            JOIN incident_items ii ON ii.incident_id = inc.incident_id
+            JOIN items i ON i.item_id = ii.item_id
+            {joins}
+            WHERE {" AND ".join(where)}
+            GROUP BY inc.incident_id
+            ORDER BY last_item_at DESC, source_count DESC, inc.severity_score DESC
+            LIMIT ?;
+        """
+        params.append(limit)
 
     with db.lock:
         rows = db.conn.execute(sql, params).fetchall()
 
-    return [
-        {
-            "incident_id": str(r["incident_id"]),
-            "title": str(r["title"]),
-            "summary": str(r["summary"]),
-            "category": str(r["category"]),
-            "first_seen_at": str(r["first_seen_at"]),
-            "last_seen_at": str(r["last_seen_at"]),
-            "last_item_at": str(r["last_item_at"]),
-            "status": str(r["status"]),
-            "severity_score": int(r["severity_score"]),
-            "lat": r["lat"],
-            "lon": r["lon"],
-            "bbox": r["bbox"],
-            "location_confidence": str(r["location_confidence"]),
-            "location_rationale": str(r["location_rationale"]),
-            "source_count": int(r["source_count"]),
-            "item_count": int(r["item_count"]),
-            "geom_geojson": r["geom_geojson"],
-        }
-        for r in rows
-    ]
+    incidents: list[dict] = []
+    for r in rows:
+        last_item_at = (
+            str(r["last_item_at"]) if r["last_item_at"] is not None else until_iso
+        )
+        incidents.append(
+            {
+                "incident_id": str(r["incident_id"]),
+                "title": str(r["title"]),
+                "summary": str(r["summary"]),
+                "category": str(r["category"]),
+                "first_seen_at": str(r["first_seen_at"]),
+                "last_seen_at": last_item_at
+                if asof_iso is not None
+                else str(r["last_seen_at"]),
+                "last_item_at": last_item_at,
+                "status": str(r["status"]),
+                "severity_score": int(r["severity_score"]),
+                "lat": r["lat"],
+                "lon": r["lon"],
+                "bbox": r["bbox"],
+                "location_confidence": str(r["location_confidence"]),
+                "location_rationale": str(r["location_rationale"]),
+                "source_count": int(r["source_count"]),
+                "item_count": int(r["item_count"]),
+                "geom_geojson": r["geom_geojson"],
+            }
+        )
+    return incidents
 
 
 @app.get("/api/incidents")
@@ -186,14 +230,17 @@ def api_incidents(
     request: Request,
     since: str | None = None,
     until: str | None = None,
-    window: str = Query(default="24h", pattern="^(1h|6h|24h|7d)$"),
+    asof: str | None = None,
+    window: str = Query(default="6h", pattern="^(1h|6h|24h|7d)$"),
     categories: str | None = None,
     bbox: str | None = None,
     q: str | None = None,
     min_severity: str | None = None,
 ) -> JSONResponse:
     db: Database = request.app.state.db
-    until_dt = _parse_iso(until) if until else _utc_now()
+    until_dt = (
+        _parse_iso(asof) if asof else (_parse_iso(until) if until else _utc_now())
+    )
     since_dt = _parse_iso(since) if since else _time_window_to_since(window, until_dt)
 
     bbox_tuple = None
@@ -208,6 +255,7 @@ def api_incidents(
         db,
         since_iso=since_dt.isoformat().replace("+00:00", "Z"),
         until_iso=until_dt.isoformat().replace("+00:00", "Z"),
+        asof_iso=until_dt.isoformat().replace("+00:00", "Z") if asof else None,
         categories=_split_csv(categories),
         bbox=bbox_tuple,
         q=q,
@@ -286,7 +334,7 @@ def api_sources(request: Request) -> JSONResponse:
 @app.get("/api/stats")
 def api_stats(
     request: Request,
-    window: str = Query(default="24h", pattern="^(1h|6h|24h|7d)$"),
+    window: str = Query(default="6h", pattern="^(1h|6h|24h|7d)$"),
 ) -> JSONResponse:
     db: Database = request.app.state.db
     until_dt = _utc_now()
@@ -327,14 +375,17 @@ def partial_incidents(
     request: Request,
     since: str | None = None,
     until: str | None = None,
-    window: str = Query(default="24h", pattern="^(1h|6h|24h|7d)$"),
+    asof: str | None = None,
+    window: str = Query(default="6h", pattern="^(1h|6h|24h|7d)$"),
     categories: str | None = None,
     bbox: str | None = None,
     q: str | None = None,
     min_severity: str | None = None,
 ) -> HTMLResponse:
     db: Database = request.app.state.db
-    until_dt = _parse_iso(until) if until else _utc_now()
+    until_dt = (
+        _parse_iso(asof) if asof else (_parse_iso(until) if until else _utc_now())
+    )
     since_dt = _parse_iso(since) if since else _time_window_to_since(window, until_dt)
 
     bbox_tuple = None
@@ -349,6 +400,7 @@ def partial_incidents(
         db,
         since_iso=since_dt.isoformat().replace("+00:00", "Z"),
         until_iso=until_dt.isoformat().replace("+00:00", "Z"),
+        asof_iso=until_dt.isoformat().replace("+00:00", "Z") if asof else None,
         categories=_split_csv(categories),
         bbox=bbox_tuple,
         q=q,
@@ -358,6 +410,33 @@ def partial_incidents(
     return templates.TemplateResponse(
         request=request,
         name="partials/incidents.html",
+        context={"incidents": incidents},
+    )
+
+
+@app.get("/partials/cyber", response_class=HTMLResponse)
+def partial_cyber(
+    request: Request,
+    window: str = Query(default="7d", pattern="^(1h|6h|24h|7d)$"),
+) -> HTMLResponse:
+    db: Database = request.app.state.db
+    until_dt = _utc_now()
+    since_dt = _time_window_to_since(window, until_dt)
+
+    incidents = _query_incidents(
+        db,
+        since_iso=since_dt.isoformat().replace("+00:00", "Z"),
+        until_iso=until_dt.isoformat().replace("+00:00", "Z"),
+        asof_iso=None,
+        categories=["cyber_cve", "cyber_kev"],
+        bbox=None,
+        q=None,
+        min_severity=None,
+        limit=200,
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/cyber.html",
         context={"incidents": incidents},
     )
 
@@ -425,10 +504,191 @@ def partial_source_health(request: Request) -> HTMLResponse:
     )
 
 
+@app.get("/partials/settings", response_class=HTMLResponse)
+def partial_settings(request: Request) -> HTMLResponse:
+    db: Database = request.app.state.db
+    settings: Settings = request.app.state.settings
+    feeds_dir = Path(__file__).resolve().parents[1] / "feeds"
+    packs = load_feed_pack_entries(feeds_dir)
+
+    pack_states: list[dict] = []
+    polling_enabled = True
+    map_tile_url = settings.map_tile_url
+    with db.lock:
+        row = db.conn.execute(
+            "SELECT value FROM app_config WHERE key = 'polling_enabled' LIMIT 1;"
+        ).fetchone()
+        if row is not None and str(row["value"]) == "0":
+            polling_enabled = False
+        row = db.conn.execute(
+            "SELECT value FROM app_config WHERE key = 'map_tile_url' LIMIT 1;"
+        ).fetchone()
+        if row is not None:
+            map_tile_url = str(row["value"])
+
+        for pack_id in sorted(packs.keys()):
+            source_ids = [e.source_id for e in packs[pack_id]]
+            enabled = False
+            if source_ids:
+                placeholders = ",".join("?" for _ in source_ids)
+                row = db.conn.execute(
+                    f"""
+                    SELECT COUNT(*) AS n
+                    FROM sources
+                    WHERE source_id IN ({placeholders}) AND enabled = 1;
+                    """,
+                    source_ids,
+                ).fetchone()
+                enabled = int(row["n"]) > 0 if row is not None else False
+            pack_states.append(
+                {
+                    "pack_id": pack_id,
+                    "enabled": enabled,
+                    "source_count": len(source_ids),
+                }
+            )
+
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/settings.html",
+        context={
+            "packs": pack_states,
+            "polling_enabled": polling_enabled,
+            "map_tile_url": map_tile_url,
+        },
+    )
+
+
+@app.post("/settings", response_class=HTMLResponse)
+async def post_settings(request: Request) -> HTMLResponse:
+    db: Database = request.app.state.db
+    feeds_dir = Path(__file__).resolve().parents[1] / "feeds"
+    packs = load_feed_pack_entries(feeds_dir)
+    form = await request.form()
+
+    with db.lock:
+        polling_enabled = "polling_enabled" in form
+        db.conn.execute(
+            """
+            INSERT INTO app_config(key, value)
+            VALUES('polling_enabled', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """,
+            ("1" if polling_enabled else "0",),
+        )
+
+        map_tile_url = str(form.get("map_tile_url") or "").strip()
+        if map_tile_url:
+            db.conn.execute(
+                """
+                INSERT INTO app_config(key, value)
+                VALUES('map_tile_url', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """,
+                (map_tile_url,),
+            )
+        else:
+            db.conn.execute("DELETE FROM app_config WHERE key = 'map_tile_url';")
+
+        for pack_id, entries in packs.items():
+            desired_enabled = f"pack_{pack_id}" in form
+            source_ids = [e.source_id for e in entries]
+            if not source_ids:
+                continue
+
+            placeholders = ",".join("?" for _ in source_ids)
+            if not desired_enabled:
+                db.conn.execute(
+                    f"UPDATE sources SET enabled = 0 WHERE source_id IN ({placeholders});",
+                    source_ids,
+                )
+                continue
+
+            db.conn.executemany(
+                "UPDATE sources SET enabled = ? WHERE source_id = ?;",
+                [(1 if e.enabled else 0, e.source_id) for e in entries],
+            )
+
+        db.conn.commit()
+
+    return partial_settings(request)
+
+
 @app.get("/partials/timeline", response_class=HTMLResponse)
-def partial_timeline(request: Request) -> HTMLResponse:
+def partial_timeline(
+    request: Request,
+    window: str = Query(default="6h", pattern="^(1h|6h|24h|7d)$"),
+) -> HTMLResponse:
+    db: Database = request.app.state.db
+    until_dt = _utc_now()
+    since_dt = _time_window_to_since(window, until_dt)
+
+    categories = _split_csv(request.query_params.get("categories"))
+    min_severity = request.query_params.get("min_severity")
+    min_sev = int(min_severity) if min_severity and min_severity.strip() else None
+
+    bucket_seconds = 300
+    if window == "24h":
+        bucket_seconds = 900
+    if window == "7d":
+        bucket_seconds = 7200
+
+    with db.lock:
+        where = ["i.published_at >= ?", "i.published_at <= ?"]
+        params: list[object] = [
+            since_dt.isoformat().replace("+00:00", "Z"),
+            until_dt.isoformat().replace("+00:00", "Z"),
+        ]
+        if categories:
+            where.append(f"inc.category IN ({','.join('?' for _ in categories)})")
+            params.extend(categories)
+        else:
+            where.append("inc.category NOT IN ('cyber_cve','cyber_kev')")
+        if min_sev is not None:
+            where.append("inc.severity_score >= ?")
+            params.append(min_sev)
+
+        rows = db.conn.execute(
+            f"""
+            SELECT ii.incident_id, i.published_at
+            FROM incident_items ii
+            JOIN items i ON i.item_id = ii.item_id
+            JOIN incidents inc ON inc.incident_id = ii.incident_id
+            WHERE {" AND ".join(where)};
+            """,
+            params,
+        ).fetchall()
+
+    start_ts = since_dt.timestamp()
+    bucket_count = int((until_dt.timestamp() - start_ts) // bucket_seconds) + 1
+    bucket_sets: list[set[str]] = [set() for _ in range(bucket_count)]
+
+    for row in rows:
+        published_at = _parse_iso(str(row["published_at"]))
+        idx = int((published_at.timestamp() - start_ts) // bucket_seconds)
+        if 0 <= idx < bucket_count:
+            bucket_sets[idx].add(str(row["incident_id"]))
+
+    buckets: list[dict] = []
+    max_count = 0
+    for i in range(bucket_count):
+        ts = (
+            (since_dt + timedelta(seconds=i * bucket_seconds))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        count = len(bucket_sets[i])
+        max_count = max(max_count, count)
+        buckets.append({"ts": ts, "count": count})
+
     return templates.TemplateResponse(
         request=request,
         name="partials/timeline.html",
-        context={},
+        context={
+            "window": window,
+            "since_iso": since_dt.isoformat().replace("+00:00", "Z"),
+            "until_iso": until_dt.isoformat().replace("+00:00", "Z"),
+            "buckets": buckets,
+            "max_count": max_count,
+        },
     )

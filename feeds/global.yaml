@@ -1,0 +1,35 @@
+- id: bbc_front_page
+  name: "BBC News - Front Page"
+  type: rss
+  url: "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/front_page/rss.xml"
+  region: global
+  tags: ["news", "world"]
+  poll_seconds: 240
+  enabled: true
+
+- id: bbc_world
+  name: "BBC News - World"
+  type: rss
+  url: "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/world/rss.xml"
+  region: global
+  tags: ["news", "world"]
+  poll_seconds: 240
+  enabled: true
+
+- id: dw_top
+  name: "DW - Top News"
+  type: rss
+  url: "https://rss.dw.com/rdf/rss-en-top"
+  region: global
+  tags: ["news", "world"]
+  poll_seconds: 240
+  enabled: true
+
+- id: aljazeera_all
+  name: "Al Jazeera - All"
+  type: rss
+  url: "https://www.aljazeera.com/xml/rss/all.xml"
+  region: global
+  tags: ["news", "world"]
+  poll_seconds: 240
+  enabled: true

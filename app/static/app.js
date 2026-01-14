@@ -10,6 +10,15 @@
     return window.location.search || "";
   }
 
+  function isPlayback() {
+    const params = new URLSearchParams(window.location.search);
+    const asof = params.get("asof");
+    if (!asof) return false;
+    const t = Date.parse(asof);
+    if (!Number.isFinite(t)) return true;
+    return Date.now() - t > 60 * 1000;
+  }
+
   async function fetchIncidents() {
     const res = await fetch("/api/incidents" + qs(), { headers: { Accept: "application/json" } });
     if (!res.ok) return [];
@@ -100,6 +109,11 @@
     window.htmx.ajax("GET", "/partials/incidents" + qs(), { target: "#incident-list", swap: "innerHTML" });
   }
 
+  function refreshCyberPanel() {
+    if (!window.htmx) return;
+    window.htmx.ajax("GET", "/partials/cyber", { target: "#cyber-list", swap: "innerHTML" });
+  }
+
   function pad2(value) {
     return String(value).padStart(2, "0");
   }
@@ -157,9 +171,11 @@
     const es = new EventSource("/sse");
     for (const type of ["incident.created", "incident.updated"]) {
       es.addEventListener(type, (ev) => {
+        if (isPlayback()) return;
         const data = JSON.parse(ev.data);
         upsertMarker(data);
         refreshIncidentsPanel();
+        if ((data.category || "").startsWith("cyber_")) refreshCyberPanel();
         const activeId = document.getElementById("incident-detail")?.dataset?.incidentId;
         if (activeId && activeId === data.incident_id) {
           window.htmx.ajax("GET", `/partials/incident/${activeId}`, { target: "#incident-detail", swap: "innerHTML" });

@@ -206,6 +206,44 @@ def _severity_score(category: str, raw: dict) -> int:
         if level == "reconsider_your_need_to_travel":
             return 65
         return 50
+    if category == "tsunami":
+        return 90
+    if category == "volcano":
+        sev = raw.get("severity_level_1_5")
+        if isinstance(sev, int):
+            return max(0, min(100, sev * 20))
+        if isinstance(sev, str) and sev.isdigit():
+            return max(0, min(100, int(sev) * 20))
+        return 70
+    if category == "wildfire":
+        frp = raw.get("frp")
+        try:
+            frp_f = float(frp) if frp is not None else None
+        except ValueError:
+            frp_f = None
+        if frp_f is not None:
+            return max(0, min(100, round(frp_f * 3.0)))
+        return 55
+    if category == "aviation_disruption":
+        kind = str(raw.get("severity_kind") or "")
+        if kind == "closure":
+            return 90
+        if kind == "ground_stop":
+            return 80
+        if kind == "gdp":
+            return 65
+        avg = raw.get("avg_delay_min")
+        if isinstance(avg, int):
+            return max(40, min(80, avg))
+        return 50
+    if category == "health_advisory":
+        return 55
+    if category == "cyber_kev":
+        return 75
+    if category == "cyber_cve":
+        return 60
+    if category == "disaster":
+        return 60
     return 40
 
 
@@ -219,6 +257,8 @@ def _incident_summary_from_item(
     if category == "tropical_cyclone":
         return item_title
     if category == "travel_advisory":
+        return item_title
+    if category in {"cyber_cve", "cyber_kev"}:
         return item_title
     return item_summary or item_title
 
@@ -245,10 +285,12 @@ def assign_item_to_incident(db: Database, item_id: str) -> ClusterResult:
         if item is None:
             raise ValueError(f"item not found: {item_id}")
 
+        category = str(item["category"])
         item_simhash_u = _i64_to_u64(int(item["simhash"]))
         bucket = (item_simhash_u >> 48) & 0xFFFF
+        lookback_hours = 24 if category == "news" else 48
         cutoff_iso = (
-            (datetime.now(tz=UTC) - timedelta(hours=48))
+            (datetime.now(tz=UTC) - timedelta(hours=lookback_hours))
             .isoformat()
             .replace("+00:00", "Z")
         )
@@ -263,7 +305,7 @@ def assign_item_to_incident(db: Database, item_id: str) -> ClusterResult:
             ORDER BY last_seen_at DESC
             LIMIT 200;
             """,
-            (item["category"], cutoff_iso, bucket),
+            (category, cutoff_iso, bucket),
         ).fetchall()
 
         best: sqlite3.Row | None = None
@@ -276,19 +318,32 @@ def assign_item_to_incident(db: Database, item_id: str) -> ClusterResult:
                 best = candidate
                 best_distance = dist
 
+        if category == "news":
+            match_dist = 4
+            match_dist_loose = 10
+            jaccard_min = 0.6
+        elif category in {"earthquake", "volcano", "tsunami"}:
+            match_dist = 8
+            match_dist_loose = 14
+            jaccard_min = 0.4
+        else:
+            match_dist = 6
+            match_dist_loose = 12
+            jaccard_min = 0.45
+
         matched_incident_id: str | None = None
-        if best is not None and best_distance <= 6:
+        if best is not None and best_distance <= match_dist:
             matched_incident_id = str(best["incident_id"])
-        elif best is not None and 7 <= best_distance <= 12:
+        elif best is not None and match_dist < best_distance <= match_dist_loose:
             sim = _token_jaccard(
                 f"{item['title']} {item['summary']}",
                 f"{best['title']} {best['summary']}",
             )
-            if sim >= 0.45:
+            if sim >= jaccard_min:
                 matched_incident_id = str(best["incident_id"])
 
         item_raw = json.loads(item["raw"])
-        item_score = _severity_score(str(item["category"]), item_raw)
+        item_score = _severity_score(category, item_raw)
 
         geom_geojson = item["geom_geojson"]
         item_bbox: tuple[float, float, float, float] | None = None
@@ -298,7 +353,7 @@ def assign_item_to_incident(db: Database, item_id: str) -> ClusterResult:
         if matched_incident_id is None:
             incident_id = str(uuid.uuid4())
             summary = _incident_summary_from_item(
-                str(item["category"]), str(item["title"]), str(item["summary"])
+                category, str(item["title"]), str(item["summary"])
             )
             token_sig = (
                 " ".join(re.findall(r"[a-z0-9]+", summary.casefold())[:6]) or None
@@ -325,7 +380,7 @@ def assign_item_to_incident(db: Database, item_id: str) -> ClusterResult:
                     incident_id,
                     str(item["title"]),
                     summary,
-                    str(item["category"]),
+                    category,
                     now_iso,
                     now_iso,
                     str(item["published_at"]),
@@ -353,7 +408,7 @@ def assign_item_to_incident(db: Database, item_id: str) -> ClusterResult:
                 "title": str(item["title"]),
                 "summary": summary,
                 "last_seen_at": now_iso,
-                "category": str(item["category"]),
+                "category": category,
                 "lat": incident_lat,
                 "lon": incident_lon,
                 "severity_score": item_score,
@@ -383,7 +438,7 @@ def assign_item_to_incident(db: Database, item_id: str) -> ClusterResult:
             raise ValueError(f"incident not found after match: {incident_id}")
 
         summary = _incident_summary_from_item(
-            str(item["category"]), str(item["title"]), str(item["summary"])
+            category, str(item["title"]), str(item["summary"])
         )
         token_sig = " ".join(re.findall(r"[a-z0-9]+", summary.casefold())[:6]) or None
         incident_simhash = simhash64(f"{incident['title']} {summary}")
@@ -474,6 +529,14 @@ def assign_item_to_incident(db: Database, item_id: str) -> ClusterResult:
             (int(counts["item_count"]), int(counts["source_count"]), incident_id),
         )
 
+        if category == "wildfire":
+            density_bonus = min(20, int(counts["item_count"]) // 10)
+            severity_out = min(100, severity_out + density_bonus)
+            db.conn.execute(
+                "UPDATE incidents SET severity_score = ? WHERE incident_id = ?;",
+                (severity_out, incident_id),
+            )
+
         _maybe_merge_incidents(db, incident_id)
         db.conn.commit()
 
@@ -483,7 +546,7 @@ def assign_item_to_incident(db: Database, item_id: str) -> ClusterResult:
             "title": str(incident["title"]),
             "summary": summary,
             "last_seen_at": now_iso,
-            "category": str(item["category"]),
+            "category": category,
             "lat": lat_out,
             "lon": lon_out,
             "severity_score": severity_out,
@@ -510,17 +573,43 @@ def _maybe_merge_incidents(db: Database, incident_id: str) -> None:
         return
 
     category = str(incident["category"])
-    if category == "earthquake":
-        max_km = 60.0
+    if category == "news":
+        max_km = 40.0
+        max_dist = 2
+        lookback_hours = 24
+    elif category in {"earthquake", "volcano"}:
+        max_km = 120.0
+        max_dist = 4
+        lookback_hours = 72
+    elif category == "wildfire":
+        max_km = 50.0
+        max_dist = 3
+        lookback_hours = 48
+    elif category == "tsunami":
+        max_km = 2500.0
+        max_dist = 4
+        lookback_hours = 72
+    elif category == "aviation_disruption":
+        max_km = 30.0
+        max_dist = 3
+        lookback_hours = 24
     elif category == "weather_alert":
         max_km = 120.0
+        max_dist = 3
+        lookback_hours = 48
     elif category == "tropical_cyclone":
         max_km = 500.0
+        max_dist = 3
+        lookback_hours = 72
     else:
         max_km = 150.0
+        max_dist = 3
+        lookback_hours = 48
 
     cutoff_iso = (
-        (datetime.now(tz=UTC) - timedelta(hours=48)).isoformat().replace("+00:00", "Z")
+        (datetime.now(tz=UTC) - timedelta(hours=lookback_hours))
+        .isoformat()
+        .replace("+00:00", "Z")
     )
     sim_u = _i64_to_u64(int(incident["incident_simhash"]))
     bucket = (sim_u >> 48) & 0xFFFF
@@ -552,7 +641,7 @@ def _maybe_merge_incidents(db: Database, incident_id: str) -> None:
         ):
             continue
         dist = hamming_distance(sim_u, _i64_to_u64(int(other["incident_simhash"])))
-        if dist > 3:
+        if dist > max_dist:
             continue
 
         other_id = str(other["incident_id"])

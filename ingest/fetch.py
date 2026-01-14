@@ -24,6 +24,7 @@ async def fetch(
     user_agent: str,
     etag: str | None,
     last_modified: str | None,
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[int, bytes | None, dict[str, str], int]:
     headers = {
         "User-Agent": user_agent,
@@ -33,6 +34,8 @@ async def fetch(
         headers["If-None-Match"] = etag
     if last_modified is not None:
         headers["If-Modified-Since"] = last_modified
+    if extra_headers:
+        headers.update(extra_headers)
 
     timeout = httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
     response = await client.get(url, headers=headers, timeout=timeout)

@@ -6,7 +6,8 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlsplit
+from pathlib import Path
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
@@ -17,18 +18,39 @@ from geo.gazetteer import (
     match_country_in_text,
     normalize_place_name,
 )
+from geo.airports import load_airports_by_iata
 from health.health import record_fetch_error, record_fetch_success
 from ingest.fetch import cache_control_max_age_seconds, fetch
+from ingest.feed_packs import load_feed_pack_entries
 from ingest.parsers.geojson import parse_geojson
+from ingest.parsers.govuk import parse_govuk_travel_advice_index
 from ingest.parsers.json import parse_json_records
+from ingest.parsers.csv import parse_csv_records
+from ingest.parsers.atom import parse_atom_feed
+from ingest.parsers.cap import parse_cap_alerts
+from ingest.parsers.faa import parse_faa_airport_status
 from ingest.parsers.rss import parse_rss
 from ingest.parsers.xml import parse_xml_feed
 from normalize.normalize import (
+    normalize_cisa_kev,
+    normalize_country_level_rss,
+    normalize_eonet_event,
+    normalize_faa_airport_disruption,
+    normalize_firms_hotspot,
+    normalize_gdacs_rss,
+    normalize_govuk_travel_advice,
+    normalize_hans_elevated_notice,
+    normalize_hans_volcano_rss_item,
     normalize_generic_rss,
     normalize_nhc_item,
+    normalize_nvd_cve,
     normalize_nws_alert,
+    normalize_reliefweb_report,
+    normalize_reliefweb_disaster,
     normalize_smartraveller_export,
     normalize_smartraveller_rss,
+    normalize_tsunami_atom,
+    normalize_tsunami_cap,
     normalize_usgs_earthquake,
 )
 from realtime.bus import Event, EventBus
@@ -37,6 +59,7 @@ from store.db import Database
 
 ParseFn = Callable[[bytes], list[dict]]
 NormalizeFn = Callable[[dict, str], dict]
+BuildUrlFn = Callable[[Database, str], str]
 
 
 @dataclass(frozen=True)
@@ -48,6 +71,9 @@ class SourcePlugin:
     poll_interval_seconds: int
     parse: ParseFn
     normalize: NormalizeFn
+    default_enabled: bool = True
+    headers: dict[str, str] | None = None
+    build_url: BuildUrlFn | None = None
 
 
 def _utc_now_iso() -> str:
@@ -252,58 +278,280 @@ def phase1_sources() -> list[SourcePlugin]:
                 source_id="smartraveller_export", record=r, fetched_at=fetched_at
             ),
         ),
+    ]
+    return sources
+
+
+def phase2_sources(settings: Settings) -> list[SourcePlugin]:
+    airports_path = (
+        Path(__file__).resolve().parents[1] / "geo" / "data" / "airports.csv"
+    )
+    airports_by_iata = (
+        load_airports_by_iata(airports_path) if airports_path.exists() else {}
+    )
+
+    nvd_headers = {"apiKey": settings.nvd_api_key} if settings.nvd_api_key else None
+    nvd_base = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+
+    def nvd_build_url(db: Database, fetched_at: str) -> str:
+        now = datetime.now(tz=UTC)
+        start = now - timedelta(hours=1)
+        with db.lock:
+            row = db.conn.execute(
+                "SELECT last_success_at FROM sources WHERE source_id = ?;",
+                ("nvd_cves",),
+            ).fetchone()
+        if row is not None and row["last_success_at"]:
+            ts = str(row["last_success_at"])
+            if ts.endswith("Z"):
+                start = datetime.fromisoformat(
+                    ts.removesuffix("Z") + "+00:00"
+                ).astimezone(tz=UTC)
+            else:
+                start = datetime.fromisoformat(ts).astimezone(tz=UTC)
+            start = start - timedelta(minutes=15)
+
+        params = {
+            "lastModStartDate": start.isoformat(timespec="milliseconds").replace(
+                "+00:00", "Z"
+            ),
+            "lastModEndDate": now.isoformat(timespec="milliseconds").replace(
+                "+00:00", "Z"
+            ),
+            "resultsPerPage": "2000",
+        }
+        return f"{nvd_base}?{urlencode(params)}"
+
+    firms_key = (settings.firms_api_key or "").strip()
+    firms_enabled = bool(firms_key)
+    firms_base = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/"
+
+    def firms_build_url(db: Database, fetched_at: str) -> str:
+        return f"{firms_base}{firms_key}/VIIRS_SNPP_NRT/world/1"
+
+    return [
         SourcePlugin(
-            source_id="bbc_front_page",
-            name="BBC Front Page",
-            url="http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/front_page/rss.xml",
+            source_id="gdacs_rss",
+            name="GDACS (Global Disaster Alerts)",
+            url="https://www.gdacs.org/xml/rss.xml",
             source_type="rss",
-            poll_interval_seconds=240,
+            poll_interval_seconds=300,
             parse=parse_rss,
-            normalize=lambda r, fetched_at: normalize_generic_rss(
-                source_id="bbc_front_page",
+            normalize=lambda r, fetched_at: normalize_gdacs_rss(
+                source_id="gdacs_rss", record=r, fetched_at=fetched_at
+            ),
+        ),
+        SourcePlugin(
+            source_id="eonet_open_events",
+            name="NASA EONET (Open Events)",
+            url="https://eonet.gsfc.nasa.gov/api/v3/events?status=open",
+            source_type="json_api",
+            poll_interval_seconds=900,
+            parse=parse_json_records,
+            normalize=lambda r, fetched_at: normalize_eonet_event(
+                source_id="eonet_open_events", record=r, fetched_at=fetched_at
+            ),
+        ),
+        SourcePlugin(
+            source_id="hans_elevated_volcanoes",
+            name="USGS HANS (Elevated Volcanoes)",
+            url="https://volcanoes.usgs.gov/hans-public/api/volcano/getElevatedVolcanoes",
+            source_type="json_api",
+            poll_interval_seconds=300,
+            parse=parse_json_records,
+            normalize=lambda r, fetched_at: normalize_hans_elevated_notice(
+                source_id="hans_elevated_volcanoes", record=r, fetched_at=fetched_at
+            ),
+        ),
+        SourcePlugin(
+            source_id="tsunami_ntwc_atom",
+            name="Tsunami.gov NTWC (Atom)",
+            url="https://tsunami.gov/events/xml/PAAQAtom.xml",
+            source_type="xml_api",
+            poll_interval_seconds=300,
+            parse=parse_atom_feed,
+            normalize=lambda r, fetched_at: normalize_tsunami_atom(
+                source_id="tsunami_ntwc_atom", record=r, fetched_at=fetched_at
+            ),
+        ),
+        SourcePlugin(
+            source_id="tsunami_ntwc_cap",
+            name="Tsunami.gov NTWC (CAP)",
+            url="https://tsunami.gov/events/xml/PAAQCAP.xml",
+            source_type="xml_api",
+            poll_interval_seconds=300,
+            parse=parse_cap_alerts,
+            normalize=lambda r, fetched_at: normalize_tsunami_cap(
+                source_id="tsunami_ntwc_cap", record=r, fetched_at=fetched_at
+            ),
+        ),
+        SourcePlugin(
+            source_id="tsunami_ptwc_atom",
+            name="Tsunami.gov PTWC (Atom)",
+            url="https://tsunami.gov/events/xml/PHEBAtom.xml",
+            source_type="xml_api",
+            poll_interval_seconds=300,
+            parse=parse_atom_feed,
+            normalize=lambda r, fetched_at: normalize_tsunami_atom(
+                source_id="tsunami_ptwc_atom", record=r, fetched_at=fetched_at
+            ),
+        ),
+        SourcePlugin(
+            source_id="tsunami_ptwc_cap",
+            name="Tsunami.gov PTWC (CAP)",
+            url="https://tsunami.gov/events/xml/PHEBCAP.xml",
+            source_type="xml_api",
+            poll_interval_seconds=300,
+            parse=parse_cap_alerts,
+            normalize=lambda r, fetched_at: normalize_tsunami_cap(
+                source_id="tsunami_ptwc_cap", record=r, fetched_at=fetched_at
+            ),
+        ),
+        SourcePlugin(
+            source_id="firms_hotspots",
+            name="NASA FIRMS (Wildfire Hotspots)",
+            url=f"{firms_base}{{FIRMS_API_KEY}}/VIIRS_SNPP_NRT/world/1",
+            source_type="csv_api",
+            poll_interval_seconds=900,
+            default_enabled=firms_enabled,
+            build_url=firms_build_url,
+            parse=parse_csv_records,
+            normalize=lambda r, fetched_at: normalize_firms_hotspot(
+                source_id="firms_hotspots", record=r, fetched_at=fetched_at
+            ),
+        ),
+        SourcePlugin(
+            source_id="faa_airport_status",
+            name="FAA NAS Status (Airport Status)",
+            url="https://nasstatus.faa.gov/api/airport-status-information",
+            source_type="xml_api",
+            poll_interval_seconds=180,
+            parse=parse_faa_airport_status,
+            normalize=lambda r, fetched_at: normalize_faa_airport_disruption(
+                source_id="faa_airport_status",
                 record=r,
                 fetched_at=fetched_at,
-                category="news",
+                airports_by_iata=airports_by_iata,
             ),
         ),
         SourcePlugin(
-            source_id="bbc_world",
-            name="BBC World",
-            url="http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/world/rss.xml",
+            source_id="cdc_travel_notices",
+            name="CDC Travel Health Notices",
+            url="https://wwwnc.cdc.gov/travel/rss/notices.xml",
             source_type="rss",
-            poll_interval_seconds=240,
+            poll_interval_seconds=3600,
             parse=parse_rss,
-            normalize=lambda r, fetched_at: normalize_generic_rss(
-                source_id="bbc_world", record=r, fetched_at=fetched_at, category="news"
-            ),
-        ),
-        SourcePlugin(
-            source_id="dw_top",
-            name="DW Top News",
-            url="https://rss.dw.com/rdf/rss-en-top",
-            source_type="rss",
-            poll_interval_seconds=240,
-            parse=parse_rss,
-            normalize=lambda r, fetched_at: normalize_generic_rss(
-                source_id="dw_top", record=r, fetched_at=fetched_at, category="news"
-            ),
-        ),
-        SourcePlugin(
-            source_id="aljazeera_all",
-            name="Al Jazeera All",
-            url="https://www.aljazeera.com/xml/rss/all.xml",
-            source_type="rss",
-            poll_interval_seconds=240,
-            parse=parse_rss,
-            normalize=lambda r, fetched_at: normalize_generic_rss(
-                source_id="aljazeera_all",
+            normalize=lambda r, fetched_at: normalize_country_level_rss(
+                source_id="cdc_travel_notices",
                 record=r,
                 fetched_at=fetched_at,
-                category="news",
+                category="health_advisory",
+                tags=["cdc", "health_advisory"],
+            ),
+        ),
+        SourcePlugin(
+            source_id="who_afro_emergencies",
+            name="WHO AFRO Emergencies",
+            url="https://www.afro.who.int/rss/emergencies.xml",
+            source_type="rss",
+            poll_interval_seconds=3600,
+            parse=parse_rss,
+            normalize=lambda r, fetched_at: normalize_country_level_rss(
+                source_id="who_afro_emergencies",
+                record=r,
+                fetched_at=fetched_at,
+                category="health_advisory",
+                tags=["who", "health_advisory"],
+            ),
+        ),
+        SourcePlugin(
+            source_id="nvd_cves",
+            name="NVD CVE API (Recent Changes)",
+            url=nvd_base,
+            source_type="json_api",
+            poll_interval_seconds=900,
+            headers=nvd_headers,
+            build_url=nvd_build_url,
+            parse=parse_json_records,
+            normalize=lambda r, fetched_at: normalize_nvd_cve(
+                source_id="nvd_cves", record=r, fetched_at=fetched_at
+            ),
+        ),
+        SourcePlugin(
+            source_id="cisa_kev",
+            name="CISA Known Exploited Vulnerabilities (KEV)",
+            url="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+            source_type="json_api",
+            poll_interval_seconds=21600,
+            parse=parse_json_records,
+            normalize=lambda r, fetched_at: normalize_cisa_kev(
+                source_id="cisa_kev", record=r, fetched_at=fetched_at
+            ),
+        ),
+        SourcePlugin(
+            source_id="travel_canada_updates",
+            name="Canada Travel Updates",
+            url="https://travel.gc.ca/feeds/rss/eng/travel-updates-24.aspx",
+            source_type="rss",
+            poll_interval_seconds=3600,
+            parse=parse_rss,
+            normalize=lambda r, fetched_at: normalize_country_level_rss(
+                source_id="travel_canada_updates",
+                record=r,
+                fetched_at=fetched_at,
+                category="travel_advisory",
+                tags=["canada", "travel_advisory"],
+            ),
+        ),
+        SourcePlugin(
+            source_id="travel_us_state",
+            name="US State Dept Travel Advisories",
+            url="https://travel.state.gov/_res/rss/TAs.xml",
+            source_type="rss",
+            poll_interval_seconds=3600,
+            parse=parse_rss,
+            normalize=lambda r, fetched_at: normalize_country_level_rss(
+                source_id="travel_us_state",
+                record=r,
+                fetched_at=fetched_at,
+                category="travel_advisory",
+                tags=["us_state", "travel_advisory"],
+            ),
+        ),
+        SourcePlugin(
+            source_id="govuk_travel_advice",
+            name="GOV.UK Foreign Travel Advice (Index)",
+            url="https://www.gov.uk/api/content/foreign-travel-advice",
+            source_type="json_api",
+            poll_interval_seconds=14400,
+            parse=parse_govuk_travel_advice_index,
+            normalize=lambda r, fetched_at: normalize_govuk_travel_advice(
+                source_id="govuk_travel_advice", record=r, fetched_at=fetched_at
+            ),
+        ),
+        SourcePlugin(
+            source_id="reliefweb_reports",
+            name="ReliefWeb Reports",
+            url="https://api.reliefweb.int/v1/reports?appname=situation-monitor&limit=50&preset=latest",
+            source_type="json_api",
+            poll_interval_seconds=1800,
+            parse=parse_json_records,
+            normalize=lambda r, fetched_at: normalize_reliefweb_report(
+                source_id="reliefweb_reports", record=r, fetched_at=fetched_at
+            ),
+        ),
+        SourcePlugin(
+            source_id="reliefweb_disasters",
+            name="ReliefWeb Disasters",
+            url="https://api.reliefweb.int/v1/disasters?appname=situation-monitor&limit=50&preset=latest",
+            source_type="json_api",
+            poll_interval_seconds=1800,
+            parse=parse_json_records,
+            normalize=lambda r, fetched_at: normalize_reliefweb_disaster(
+                source_id="reliefweb_disasters", record=r, fetched_at=fetched_at
             ),
         ),
     ]
-    return sources
 
 
 def ensure_sources(db: Database, plugins: list[SourcePlugin]) -> None:
@@ -315,7 +563,7 @@ def ensure_sources(db: Database, plugins: list[SourcePlugin]) -> None:
                 INSERT OR IGNORE INTO sources(
                   source_id, name, source_type, url, poll_interval_seconds, enabled, next_fetch_at
                 )
-                VALUES(?, ?, ?, ?, ?, 1, ?);
+                VALUES(?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     plugin.source_id,
@@ -323,6 +571,7 @@ def ensure_sources(db: Database, plugins: list[SourcePlugin]) -> None:
                     plugin.source_type,
                     plugin.url,
                     plugin.poll_interval_seconds,
+                    1 if plugin.default_enabled else 0,
                     now_iso,
                 ),
             )
@@ -346,30 +595,70 @@ def ensure_sources(db: Database, plugins: list[SourcePlugin]) -> None:
         db.conn.commit()
 
 
+def feed_pack_sources(feeds_dir: Path) -> list[SourcePlugin]:
+    packs = load_feed_pack_entries(feeds_dir)
+    sources: list[SourcePlugin] = []
+    for pack in packs.values():
+        for entry in pack:
+            if entry.source_type != "rss":
+                continue
+            sources.append(
+                SourcePlugin(
+                    source_id=entry.source_id,
+                    name=entry.name,
+                    url=entry.url,
+                    source_type="rss",
+                    poll_interval_seconds=entry.poll_seconds,
+                    default_enabled=entry.enabled,
+                    parse=parse_rss,
+                    normalize=lambda r, fetched_at, entry=entry: normalize_generic_rss(
+                        source_id=entry.source_id,
+                        record=r,
+                        fetched_at=fetched_at,
+                        category="news",
+                        tags=entry.tags,
+                    ),
+                )
+            )
+    return sources
+
+
 async def run_scheduler(*, settings: Settings, db: Database, bus: EventBus) -> None:
-    plugins = phase1_sources()
+    feeds_dir = Path(__file__).resolve().parents[1] / "feeds"
+    plugins = phase1_sources() + phase2_sources(settings) + feed_pack_sources(feeds_dir)
     plugin_by_id = {p.source_id: p for p in plugins}
     ensure_sources(db, plugins)
 
     global_sem = asyncio.Semaphore(4)
     host_sems: dict[str, asyncio.Semaphore] = {}
+    plugins_lock = asyncio.Lock()
     next_cleanup_at = datetime.now(tz=UTC) + timedelta(minutes=10)
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
         while True:
             now_iso = _utc_now_iso()
+            polling_enabled = True
             with db.lock:
-                due = db.conn.execute(
-                    """
-                    SELECT source_id, url, etag, last_modified, poll_interval_seconds
-                    FROM sources
-                    WHERE enabled = 1
-                      AND (next_fetch_at IS NULL OR next_fetch_at <= ?)
-                    ORDER BY COALESCE(next_fetch_at, '') ASC
-                    LIMIT 12;
-                    """,
-                    (now_iso,),
-                ).fetchall()
+                row = db.conn.execute(
+                    "SELECT value FROM app_config WHERE key = 'polling_enabled' LIMIT 1;"
+                ).fetchone()
+                if row is not None and str(row["value"]) == "0":
+                    polling_enabled = False
+
+            due = []
+            if polling_enabled:
+                with db.lock:
+                    due = db.conn.execute(
+                        """
+                        SELECT source_id, url, etag, last_modified, poll_interval_seconds
+                        FROM sources
+                        WHERE enabled = 1
+                          AND (next_fetch_at IS NULL OR next_fetch_at <= ?)
+                        ORDER BY COALESCE(next_fetch_at, '') ASC
+                        LIMIT 12;
+                        """,
+                        (now_iso,),
+                    ).fetchall()
 
             if not due:
                 await asyncio.sleep(0.5)
@@ -389,6 +678,8 @@ async def run_scheduler(*, settings: Settings, db: Database, bus: EventBus) -> N
                                 plugin,
                                 db,
                                 bus,
+                                plugin_by_id,
+                                plugins_lock,
                                 settings.user_agent,
                                 global_sem,
                                 host_sem,
@@ -413,6 +704,8 @@ async def _run_one(
     plugin: SourcePlugin,
     db: Database,
     bus: EventBus,
+    plugin_by_id: dict[str, SourcePlugin],
+    plugins_lock: asyncio.Lock,
     user_agent: str,
     global_sem: asyncio.Semaphore,
     host_sem: asyncio.Semaphore,
@@ -422,13 +715,15 @@ async def _run_one(
 ) -> None:
     async with global_sem, host_sem:
         fetched_at = _utc_now_iso()
+        url = plugin.build_url(db, fetched_at) if plugin.build_url else plugin.url
         try:
             status_code, content, headers, elapsed_ms = await fetch(
                 client,
-                url=plugin.url,
+                url=url,
                 user_agent=user_agent,
                 etag=etag,
                 last_modified=last_modified,
+                extra_headers=plugin.headers,
             )
         except httpx.TimeoutException:
             backoff = record_fetch_error(
@@ -525,6 +820,84 @@ async def _run_one(
                 )
             )
             return
+
+        if plugin.source_id == "hans_elevated_volcanoes":
+            volcanoes: dict[str, str] = {}
+            for record in records:
+                vnum = str(record.get("vnum") or "").strip()
+                if not vnum:
+                    continue
+                volcanoes[vnum] = (
+                    str(record.get("volcano_name") or vnum).strip() or vnum
+                )
+
+            if volcanoes:
+                new_plugins: list[SourcePlugin] = []
+                current_ids = {f"hans_volcano_{vnum}" for vnum in volcanoes}
+                async with plugins_lock:
+                    for vnum, name in volcanoes.items():
+                        source_id = f"hans_volcano_{vnum}"
+                        if source_id in plugin_by_id:
+                            continue
+                        new_plugins.append(
+                            SourcePlugin(
+                                source_id=source_id,
+                                name=f"USGS HANS Volcano ({name})",
+                                url=f"https://volcanoes.usgs.gov/hans-public/rss/cap/volcano/{vnum}",
+                                source_type="xml_api",
+                                poll_interval_seconds=600,
+                                parse=parse_xml_feed,
+                                normalize=lambda r,
+                                fetched_at,
+                                vnum=vnum,
+                                name=name,
+                                source_id=source_id: normalize_hans_volcano_rss_item(
+                                    source_id=source_id,
+                                    record=r,
+                                    fetched_at=fetched_at,
+                                    volcano_name=name,
+                                    vnum=vnum,
+                                ),
+                            )
+                        )
+                    for added in new_plugins:
+                        plugin_by_id[added.source_id] = added
+
+                ensure_sources(db, new_plugins)
+
+                with db.lock:
+                    rows = db.conn.execute(
+                        """
+                        SELECT source_id
+                        FROM sources
+                        WHERE source_id LIKE 'hans_volcano_%';
+                        """
+                    ).fetchall()
+                    existing_ids = {str(r["source_id"]) for r in rows}
+                    to_disable = sorted(existing_ids - current_ids)
+                    if to_disable:
+                        placeholders = ",".join("?" for _ in to_disable)
+                        db.conn.execute(
+                            f"UPDATE sources SET enabled = 0 WHERE source_id IN ({placeholders});",
+                            to_disable,
+                        )
+                    to_enable = sorted(current_ids)
+                    if to_enable:
+                        placeholders = ",".join("?" for _ in to_enable)
+                        db.conn.execute(
+                            f"UPDATE sources SET enabled = 1 WHERE source_id IN ({placeholders});",
+                            to_enable,
+                        )
+                    db.conn.commit()
+            else:
+                with db.lock:
+                    db.conn.execute(
+                        "UPDATE sources SET enabled = 0 WHERE source_id LIKE 'hans_volcano_%';"
+                    )
+                    db.conn.commit()
+
+        if plugin.source_id.startswith("tsunami_"):
+            next_seconds = 90 if records else 300
 
         record_fetch_success(
             db,

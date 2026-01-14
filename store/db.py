@@ -186,6 +186,15 @@ _MIGRATIONS: list[tuple[int, str]] = [
           ON places(kind, normalized_name);
         """,
     ),
+    (
+        3,
+        """
+        CREATE TABLE IF NOT EXISTS app_config (
+          key TEXT NOT NULL PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        """,
+    ),
 ]
 
 

@@ -29,7 +29,76 @@
 
     <script defer src="/static/app.js"></script>
   </head>
-  <body class="h-screen bg-slate-950 text-slate-100">
+  <body
+    class="h-screen bg-slate-950 text-slate-100"
+    x-data="{
+      window: new URLSearchParams(window.location.search).get('window') || '6h',
+      nowTs: Date.now(),
+      cursorTs: Date.now(),
+      playing: false,
+      playTimer: null,
+      timelineOpen: false,
+      cyberOpen: true,
+      stepMs: 5 * 60 * 1000,
+      get windowMs() {
+        if (this.window === '1h') return 60 * 60 * 1000
+        if (this.window === '6h') return 6 * 60 * 60 * 1000
+        if (this.window === '24h') return 24 * 60 * 60 * 1000
+        if (this.window === '7d') return 7 * 24 * 60 * 60 * 1000
+        return 24 * 60 * 60 * 1000
+      },
+      get minTs() { return this.nowTs - this.windowMs },
+      get maxTs() { return this.nowTs },
+      get playback() { return this.timelineOpen && (this.cursorTs < this.maxTs - 30_000) },
+      clampCursor() {
+        if (this.cursorTs < this.minTs) this.cursorTs = this.minTs
+        if (this.cursorTs > this.maxTs) this.cursorTs = this.maxTs
+      },
+      applyPlayback() {
+        const form = document.getElementById('filters-form')
+        if (form) form.dispatchEvent(new Event('change', { bubbles: true }))
+      },
+      step(deltaMs) {
+        this.cursorTs = Math.min(this.maxTs, Math.max(this.minTs, this.cursorTs + deltaMs))
+        this.applyPlayback()
+      },
+      togglePlay() {
+        this.playing = !this.playing
+        if (!this.playing) {
+          if (this.playTimer) clearInterval(this.playTimer)
+          this.playTimer = null
+          return
+        }
+        this.playTimer = setInterval(() => {
+          this.nowTs = Date.now()
+          if (this.cursorTs >= this.maxTs) {
+            this.togglePlay()
+            return
+          }
+          this.cursorTs = Math.min(this.maxTs, this.cursorTs + this.stepMs)
+          this.applyPlayback()
+        }, 1200)
+      },
+      init() {
+        const qs = new URLSearchParams(window.location.search)
+        const win = qs.get('window')
+        if (win) this.window = win
+        const asof = qs.get('asof')
+        if (asof) {
+          const t = Date.parse(asof)
+          if (!Number.isNaN(t)) {
+            this.cursorTs = t
+            this.timelineOpen = true
+          }
+        }
+        setInterval(() => {
+          this.nowTs = Date.now()
+          if (this.timelineOpen && !this.playing && !this.playback) this.cursorTs = this.nowTs
+        }, 1000)
+      }
+    }"
+    x-init="init()"
+  >
     <div class="flex h-full flex-col">
       <header class="flex items-center justify-between border-b border-slate-800 px-4 py-3">
         <div class="flex items-center gap-3">
@@ -45,18 +114,33 @@
         <div class="flex items-center gap-3">
           <button
             class="rounded bg-slate-800 px-3 py-1 text-sm hover:bg-slate-700"
+            @click="timelineOpen = !timelineOpen; if(!timelineOpen){ playing=false; if(playTimer){clearInterval(playTimer); playTimer=null}; applyPlayback() }"
+          >
+            Timeline
+          </button>
+          <button
+            class="rounded bg-slate-800 px-3 py-1 text-sm hover:bg-slate-700"
             hx-get="/partials/source-health"
             hx-target="#modal-content"
             hx-trigger="click"
-            hx-on:click="document.getElementById('modal').classList.remove('hidden')"
+            hx-on:click="document.getElementById('modal-title').textContent = 'Source health'; document.getElementById('modal').classList.remove('hidden')"
           >
             Source health
+          </button>
+          <button
+            class="rounded bg-slate-800 px-3 py-1 text-sm hover:bg-slate-700"
+            hx-get="/partials/settings"
+            hx-target="#modal-content"
+            hx-trigger="click"
+            hx-on:click="document.getElementById('modal-title').textContent = 'Settings'; document.getElementById('modal').classList.remove('hidden')"
+          >
+            Settings
           </button>
         </div>
       </header>
 
       <div class="flex flex-1 overflow-hidden">
-        <aside class="w-[22rem] shrink-0 border-r border-slate-800">
+        <aside class="flex w-[22rem] shrink-0 flex-col border-r border-slate-800">
           <form
             id="filters-form"
             class="border-b border-slate-800 p-3"
@@ -65,11 +149,17 @@
             hx-push-url="true"
             hx-trigger="load, change delay:350ms, submit"
           >
+            <input type="hidden" name="asof" :value="playback ? new Date(cursorTs).toISOString() : ''" />
             <div class="flex items-center gap-2">
-              <select name="window" class="w-28 rounded bg-slate-900 px-2 py-1 text-sm">
+              <select
+                name="window"
+                class="w-28 rounded bg-slate-900 px-2 py-1 text-sm"
+                x-model="window"
+                @change="clampCursor()"
+              >
                 <option value="1h">Last 1h</option>
-                <option value="6h">Last 6h</option>
-                <option value="24h" selected>Last 24h</option>
+                <option value="6h" selected>Last 6h</option>
+                <option value="24h">Last 24h</option>
                 <option value="7d">Last 7d</option>
               </select>
               <input
@@ -80,7 +170,7 @@
             </div>
             <div class="mt-2 flex flex-wrap gap-2" x-data="{ cats: [] }">
               <input type="hidden" name="categories" :value="cats.join(',')" />
-              <template x-for="c in ['earthquake','weather_alert','tropical_cyclone','travel_advisory','news']">
+              <template x-for="c in ['earthquake','weather_alert','tropical_cyclone','tsunami','volcano','wildfire','aviation_disruption','health_advisory','travel_advisory','disaster','news','cyber_cve','cyber_kev']">
                 <button
                   type="button"
                   class="rounded border border-slate-700 px-2 py-1 text-xs hover:bg-slate-800"
@@ -103,7 +193,28 @@
             </div>
           </form>
 
-          <div id="incident-list" class="h-full overflow-y-auto"></div>
+          <div id="incident-list" class="flex-1 overflow-y-auto"></div>
+
+          <div class="border-t border-slate-800">
+            <div class="flex items-center justify-between px-3 py-2">
+              <div class="text-xs font-semibold text-slate-300">Cyber</div>
+              <button
+                type="button"
+                class="text-xs text-slate-400 hover:text-slate-200"
+                @click="cyberOpen = !cyberOpen"
+                x-text="cyberOpen ? 'Hide' : 'Show'"
+              ></button>
+            </div>
+            <div
+              id="cyber-list"
+              class="max-h-56 overflow-y-auto"
+              x-show="cyberOpen"
+              x-transition
+              hx-get="/partials/cyber"
+              hx-trigger="load"
+              hx-swap="innerHTML"
+            ></div>
+          </div>
         </aside>
 
         <main class="relative flex-1">
@@ -116,6 +227,50 @@
             <div class="p-4 text-sm text-slate-400">Select an incident.</div>
           </section>
         </main>
+      </div>
+    </div>
+
+    <div
+      class="pointer-events-auto fixed inset-x-0 bottom-0 z-20 border-t border-slate-800 bg-slate-950/95"
+      x-show="timelineOpen"
+      x-transition
+    >
+      <div class="mx-auto max-w-5xl p-3">
+        <div class="flex items-center justify-between">
+          <div class="text-sm font-semibold">Playback</div>
+          <button class="text-sm text-slate-400 hover:text-slate-200" @click="timelineOpen=false; playing=false; if(playTimer){clearInterval(playTimer); playTimer=null}; applyPlayback()">
+            Close
+          </button>
+        </div>
+
+        <div class="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-300">
+          <button class="rounded bg-slate-800 px-2 py-1 hover:bg-slate-700" @click="step(-stepMs)">-5m</button>
+          <button class="rounded bg-slate-800 px-2 py-1 hover:bg-slate-700" @click="togglePlay()" x-text="playing ? 'Pause' : 'Play'"></button>
+          <button class="rounded bg-slate-800 px-2 py-1 hover:bg-slate-700" @click="step(stepMs)">+5m</button>
+          <div class="ml-2 text-slate-400">
+            Cursor:
+            <span x-text="new Date(cursorTs).toISOString()"></span>
+            <span class="ml-2 rounded bg-slate-800 px-2 py-0.5 text-[11px]" x-text="playback ? 'playback' : 'live'"></span>
+          </div>
+        </div>
+
+        <input
+          class="mt-3 w-full"
+          type="range"
+          :min="minTs"
+          :max="maxTs"
+          :step="stepMs"
+          x-model.number="cursorTs"
+          @input="clampCursor(); applyPlayback()"
+        />
+
+        <div
+          id="timeline-histogram"
+          class="mt-2"
+          hx-get="/partials/timeline"
+          hx-trigger="load, change from:#filters-form delay:500ms"
+          hx-include="#filters-form"
+        ></div>
       </div>
     </div>
 
@@ -137,7 +292,7 @@
     >
       <div class="mx-auto mt-20 w-[46rem] rounded bg-slate-950 p-4 shadow-lg">
         <div class="flex items-center justify-between">
-          <div class="text-sm font-semibold">Source health</div>
+          <div id="modal-title" class="text-sm font-semibold">Panel</div>
           <button
             class="text-sm text-slate-400 hover:text-slate-200"
             onclick="document.getElementById('modal').classList.add('hidden')"
