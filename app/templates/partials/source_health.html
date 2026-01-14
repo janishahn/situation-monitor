@@ -3,9 +3,11 @@
     <thead class="sticky top-0 bg-slate-950">
       <tr class="border-b border-slate-800 text-slate-400">
         <th class="w-48 py-2">Source</th>
-        <th class="w-24 py-2">Type</th>
+        <th class="w-20 py-2">Type</th>
+        <th class="w-24 py-2">Next</th>
         <th class="w-24 py-2">OK</th>
         <th class="w-24 py-2">Err</th>
+        <th class="w-16 py-2">Rate</th>
         <th class="w-20 py-2">Fail</th>
         <th class="w-20 py-2">Status</th>
         <th class="w-24 py-2">ms</th>
@@ -17,10 +19,22 @@
         <td class="py-2 pr-2">
           <div class="truncate text-slate-200">{{ s.name }}</div>
           <div class="truncate text-[11px] text-slate-500">{{ s.source_id }}</div>
+          {% if s.last_error %}
+          <div class="truncate text-[11px] text-red-300/80" title="{{ s.last_error }}">{{ s.last_error }}</div>
+          {% endif %}
         </td>
         <td class="py-2 text-slate-300">{{ s.source_type }}</td>
-        <td class="py-2 text-slate-300">{{ s.last_success_at or '-' }}</td>
-        <td class="py-2 text-slate-300">{{ s.last_error_at or '-' }}</td>
+        <td class="py-2 text-slate-300">{{ s.next_fetch_at | eu_datetime if s.next_fetch_at else '-' }}</td>
+        <td class="py-2 text-slate-300">{{ s.last_success_at | eu_datetime if s.last_success_at else '-' }}</td>
+        <td class="py-2 text-slate-300">{{ s.last_error_at | eu_datetime if s.last_error_at else '-' }}</td>
+        <td class="py-2 text-slate-300">
+          {% set total = s.success_count + s.error_count %}
+          {% if total > 0 %}
+          {{ "%.1f"|format(s.error_count / total * 100) }}%
+          {% else %}
+          -
+          {% endif %}
+        </td>
         <td class="py-2 text-slate-300">{{ s.consecutive_failures }}</td>
         <td class="py-2 text-slate-300">{{ s.last_status_code or '-' }}</td>
         <td class="py-2 text-slate-300">{{ s.last_fetch_ms or '-' }}</td>
@@ -29,4 +43,3 @@
     </tbody>
   </table>
 </div>
-

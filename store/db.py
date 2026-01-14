@@ -195,6 +195,28 @@ _MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        4,
+        """
+        ALTER TABLE sources ADD COLUMN cursor TEXT NULL;
+        ALTER TABLE sources ADD COLUMN success_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE sources ADD COLUMN error_count INTEGER NOT NULL DEFAULT 0;
+        """,
+    ),
+    (
+        5,
+        """
+        DELETE FROM places
+        WHERE place_id NOT IN (
+          SELECT MIN(place_id) FROM places GROUP BY kind, normalized_name, country_code, admin1
+        );
+
+        DROP INDEX IF EXISTS places_kind_normalized_uq;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS places_kind_normalized_cc_admin1_uq
+          ON places(kind, normalized_name, country_code, admin1);
+        """,
+    ),
 ]
 
 

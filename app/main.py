@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import uuid
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from app.settings import Settings
-from geo.gazetteer import seed_country_places, suggest_places
+from geo.gazetteer import seed_places, suggest_places
 from ingest.feed_packs import load_feed_pack_entries
 from ingest.scheduler import run_scheduler
 from realtime.bus import EventBus
@@ -59,13 +68,67 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.db = db
     app.state.bus = bus
-    seed_country_places(
-        db,
-        Path(__file__).resolve().parents[1]
-        / "geo"
-        / "data"
-        / "ne_110m_admin_0_countries.geojson",
-    )
+    seed_places(db, Path(__file__).resolve().parents[1] / "geo" / "data")
+    now_iso = _utc_now_iso()
+    with db.lock:
+        row = db.conn.execute("SELECT COUNT(*) AS n FROM saved_views;").fetchone()
+        if row is not None and int(row["n"]) == 0:
+            presets = [
+                (
+                    "Crisis mode",
+                    {
+                        "window": "6h",
+                        "categories": [
+                            "earthquake",
+                            "weather_alert",
+                            "tropical_cyclone",
+                            "tsunami",
+                            "volcano",
+                            "wildfire",
+                            "maritime_warning",
+                            "disaster",
+                        ],
+                        "q": "",
+                        "min_severity": "",
+                        "map": {"center": [20, 0], "zoom": 2},
+                    },
+                ),
+                (
+                    "Cyber watch",
+                    {
+                        "window": "7d",
+                        "categories": ["cyber_cve", "cyber_kev"],
+                        "q": "",
+                        "min_severity": "",
+                        "map": {"center": [20, 0], "zoom": 2},
+                    },
+                ),
+                (
+                    "Regional focus: East Asia",
+                    {
+                        "window": "24h",
+                        "categories": [],
+                        "q": "",
+                        "min_severity": "",
+                        "map": {"center": [30, 120], "zoom": 3},
+                    },
+                ),
+            ]
+            for name, config in presets:
+                db.conn.execute(
+                    """
+                    INSERT INTO saved_views(view_id, name, config_json, created_at, updated_at)
+                    VALUES(?, ?, ?, ?, ?);
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        name,
+                        json.dumps(config, ensure_ascii=False),
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+            db.conn.commit()
 
     scheduler_task = asyncio.create_task(
         run_scheduler(settings=settings, db=db, bus=bus)
@@ -89,11 +152,90 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
 def _format_eu_datetime(value: str) -> str:
-    dt = _parse_iso(value).astimezone(tz=UTC)
+    dt = _parse_iso(value).astimezone()
     return dt.strftime("%d.%m.%Y %H:%M")
 
 
 templates.env.filters["eu_datetime"] = _format_eu_datetime
+
+
+def _tile_csp_source(url: str) -> str | None:
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.netloc:
+        return None
+    host = parts.netloc.replace("{s}", "*")
+    return f"{parts.scheme}://{host}"
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    settings: Settings = request.app.state.settings
+    db: Database = request.app.state.db
+
+    map_tile_url = settings.map_tile_url
+    x_embeds_enabled = False
+
+    with db.lock:
+        row = db.conn.execute(
+            "SELECT value FROM app_config WHERE key = 'map_tile_url' LIMIT 1;"
+        ).fetchone()
+        if row is not None:
+            map_tile_url = str(row["value"])
+        row = db.conn.execute(
+            "SELECT value FROM app_config WHERE key = 'x_embeds_enabled' LIMIT 1;"
+        ).fetchone()
+        if row is not None and str(row["value"]) == "1":
+            x_embeds_enabled = True
+
+    tile_src = _tile_csp_source(map_tile_url)
+    img_src = ["'self'", "data:", "https://unpkg.com"]
+    if tile_src:
+        img_src.append(tile_src)
+
+    script_src = [
+        "'self'",
+        "'unsafe-inline'",
+        "'unsafe-eval'",
+        "https://cdn.tailwindcss.com",
+        "https://unpkg.com",
+    ]
+    frame_src = ["'none'"]
+    connect_src = ["'self'", "https://time.now"]
+
+    if x_embeds_enabled:
+        script_src.append("https://platform.twitter.com")
+        frame_src = ["https://platform.twitter.com", "https://syndication.twitter.com"]
+        connect_src.append("https://platform.twitter.com")
+        connect_src.append("https://syndication.twitter.com")
+
+    csp = (
+        "default-src 'self'; "
+        + f"script-src {' '.join(script_src)}; "
+        + "style-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.tailwindcss.com; "
+        + f"img-src {' '.join(img_src)}; "
+        + "font-src 'self' https://unpkg.com data:; "
+        + f"connect-src {' '.join(connect_src)}; "
+        + f"frame-src {' '.join(frame_src)}; "
+        + "base-uri 'self'; "
+        + "form-action 'self'; "
+        + "frame-ancestors 'none'"
+    )
+
+    response.headers["Content-Security-Policy"] = csp
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+
+    if (
+        request.url.scheme == "https"
+        or request.headers.get("x-forwarded-proto") == "https"
+    ):
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
+
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -101,18 +243,38 @@ def index(request: Request) -> HTMLResponse:
     settings: Settings = request.app.state.settings
     db: Database = request.app.state.db
     map_tile_url = settings.map_tile_url
+    x_embeds_enabled = False
+    x_scan_urls: list[str] = []
     with db.lock:
         row = db.conn.execute(
             "SELECT value FROM app_config WHERE key = 'map_tile_url' LIMIT 1;"
         ).fetchone()
         if row is not None:
             map_tile_url = str(row["value"])
+        row = db.conn.execute(
+            "SELECT value FROM app_config WHERE key = 'x_embeds_enabled' LIMIT 1;"
+        ).fetchone()
+        if row is not None and str(row["value"]) == "1":
+            x_embeds_enabled = True
+        row = db.conn.execute(
+            "SELECT value FROM app_config WHERE key = 'x_scan_urls' LIMIT 1;"
+        ).fetchone()
+        if row is not None and row["value"]:
+            try:
+                urls = json.loads(str(row["value"]))
+                if isinstance(urls, list):
+                    x_scan_urls = [str(u).strip() for u in urls if str(u).strip()]
+            except json.JSONDecodeError:
+                x_scan_urls = []
     return templates.TemplateResponse(
         request=request,
         name="index.html",
         context={
             "map_tile_url": map_tile_url,
             "now_iso": _utc_now_iso(),
+            "x_embeds_enabled": x_embeds_enabled,
+            "x_scan_urls": x_scan_urls,
+            "x_scan_urls_json": json.dumps(x_scan_urls, ensure_ascii=False),
         },
     )
 
@@ -127,7 +289,7 @@ def _query_incidents(
     bbox: tuple[float, float, float, float] | None,
     q: str | None,
     min_severity: int | None,
-    limit: int = 300,
+    limit: int = 200,
 ) -> list[dict]:
     params: list[object] = []
 
@@ -323,7 +485,8 @@ def api_sources(request: Request) -> JSONResponse:
             """
             SELECT source_id, name, source_type, url, poll_interval_seconds, enabled,
                    next_fetch_at, last_fetch_at, last_success_at, last_error_at,
-                   consecutive_failures, last_status_code, last_fetch_ms, last_error
+                   consecutive_failures, last_status_code, last_fetch_ms, last_error,
+                   success_count, error_count
             FROM sources
             ORDER BY name ASC;
             """
@@ -370,6 +533,188 @@ def api_places_suggest(request: Request, q: str) -> JSONResponse:
     return JSONResponse(results)
 
 
+class SavedViewCreate(BaseModel):
+    name: str
+    config: dict
+
+
+class SavedViewUpdate(BaseModel):
+    name: str | None = None
+    config: dict | None = None
+
+
+@app.get("/api/saved-views")
+def api_saved_views(request: Request) -> JSONResponse:
+    db: Database = request.app.state.db
+    with db.lock:
+        rows = db.conn.execute(
+            """
+            SELECT view_id, name, config_json, created_at, updated_at
+            FROM saved_views
+            ORDER BY name ASC;
+            """
+        ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        config = json.loads(str(r["config_json"]))
+        out.append(
+            {
+                "view_id": str(r["view_id"]),
+                "name": str(r["name"]),
+                "config": config,
+                "created_at": str(r["created_at"]),
+                "updated_at": str(r["updated_at"]),
+            }
+        )
+    return JSONResponse(out)
+
+
+@app.post("/api/saved-views")
+async def api_saved_views_create(
+    request: Request, payload: SavedViewCreate
+) -> JSONResponse:
+    db: Database = request.app.state.db
+    now_iso = _utc_now_iso()
+    view_id = str(uuid.uuid4())
+    with db.lock:
+        db.conn.execute(
+            """
+            INSERT INTO saved_views(view_id, name, config_json, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?);
+            """,
+            (view_id, payload.name, json.dumps(payload.config), now_iso, now_iso),
+        )
+        db.conn.commit()
+    return JSONResponse({"view_id": view_id, "status": "created"})
+
+
+@app.put("/api/saved-views/{view_id}")
+async def api_saved_views_update(
+    request: Request, view_id: str, payload: SavedViewUpdate
+) -> JSONResponse:
+    db: Database = request.app.state.db
+    now_iso = _utc_now_iso()
+    with db.lock:
+        row = db.conn.execute(
+            "SELECT name, config_json FROM saved_views WHERE view_id = ?;",
+            (view_id,),
+        ).fetchone()
+        if row is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+
+        name = payload.name if payload.name is not None else str(row["name"])
+        config_json = (
+            json.dumps(payload.config)
+            if payload.config is not None
+            else str(row["config_json"])
+        )
+
+        db.conn.execute(
+            """
+            UPDATE saved_views
+            SET name = ?, config_json = ?, updated_at = ?
+            WHERE view_id = ?;
+            """,
+            (name, config_json, now_iso, view_id),
+        )
+        db.conn.commit()
+
+    return JSONResponse({"status": "updated"})
+
+
+@app.delete("/api/saved-views/{view_id}")
+def api_saved_views_delete(request: Request, view_id: str) -> JSONResponse:
+    db: Database = request.app.state.db
+    with db.lock:
+        cur = db.conn.execute("DELETE FROM saved_views WHERE view_id = ?;", (view_id,))
+        db.conn.commit()
+    if cur.rowcount <= 0:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return JSONResponse({"status": "deleted"})
+
+
+@app.post("/api/saved-views/{view_id}/apply")
+def api_saved_views_apply(request: Request, view_id: str) -> JSONResponse:
+    db: Database = request.app.state.db
+    with db.lock:
+        row = db.conn.execute(
+            "SELECT config_json FROM saved_views WHERE view_id = ?;", (view_id,)
+        ).fetchone()
+        if row is None:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        config = json.loads(str(row["config_json"]))
+
+        enabled_source_ids = config.get("enabled_source_ids")
+        if isinstance(enabled_source_ids, list):
+            ids = [str(s) for s in enabled_source_ids]
+            db.conn.execute("UPDATE sources SET enabled = 0;")
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                db.conn.execute(
+                    f"UPDATE sources SET enabled = 1 WHERE source_id IN ({placeholders});",
+                    ids,
+                )
+
+        db.conn.commit()
+
+    return JSONResponse({"status": "applied"})
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics(request: Request) -> PlainTextResponse:
+    db: Database = request.app.state.db
+    with db.lock:
+        items_total = int(
+            db.conn.execute("SELECT COUNT(*) AS n FROM items;").fetchone()["n"]
+        )
+        incidents_total = int(
+            db.conn.execute("SELECT COUNT(*) AS n FROM incidents;").fetchone()["n"]
+        )
+        incidents_active = int(
+            db.conn.execute(
+                "SELECT COUNT(*) AS n FROM incidents WHERE status = 'active';"
+            ).fetchone()["n"]
+        )
+        sources_enabled = int(
+            db.conn.execute(
+                "SELECT COUNT(*) AS n FROM sources WHERE enabled = 1;"
+            ).fetchone()["n"]
+        )
+        sources_failing = int(
+            db.conn.execute(
+                "SELECT COUNT(*) AS n FROM sources WHERE consecutive_failures > 0;"
+            ).fetchone()["n"]
+        )
+        last_ingest = db.conn.execute(
+            "SELECT MAX(last_success_at) AS ts FROM sources;"
+        ).fetchone()["ts"]
+
+    lines = [
+        "# HELP situation_monitor_items_total Total items stored",
+        "# TYPE situation_monitor_items_total gauge",
+        f"situation_monitor_items_total {items_total}",
+        "# HELP situation_monitor_incidents_total Total incidents stored",
+        "# TYPE situation_monitor_incidents_total gauge",
+        f"situation_monitor_incidents_total {incidents_total}",
+        "# HELP situation_monitor_incidents_active Active incidents",
+        "# TYPE situation_monitor_incidents_active gauge",
+        f"situation_monitor_incidents_active {incidents_active}",
+        "# HELP situation_monitor_sources_enabled Enabled sources",
+        "# TYPE situation_monitor_sources_enabled gauge",
+        f"situation_monitor_sources_enabled {sources_enabled}",
+        "# HELP situation_monitor_sources_failing Sources with consecutive failures",
+        "# TYPE situation_monitor_sources_failing gauge",
+        f"situation_monitor_sources_failing {sources_failing}",
+    ]
+    if last_ingest:
+        lines.append(
+            "# HELP situation_monitor_last_ingest_timestamp Last source success timestamp"
+        )
+        lines.append("# TYPE situation_monitor_last_ingest_timestamp gauge")
+        lines.append(f'situation_monitor_last_ingest_timestamp{{ts="{last_ingest}"}} 1')
+    return PlainTextResponse("\n".join(lines) + "\n")
+
+
 @app.get("/partials/incidents", response_class=HTMLResponse)
 def partial_incidents(
     request: Request,
@@ -381,7 +726,10 @@ def partial_incidents(
     bbox: str | None = None,
     q: str | None = None,
     min_severity: str | None = None,
-) -> HTMLResponse:
+):
+    if "HX-Request" not in request.headers:
+        qs = str(request.url.query)
+        return RedirectResponse(url=f"/?{qs}" if qs else "/", status_code=302)
     db: Database = request.app.state.db
     until_dt = (
         _parse_iso(asof) if asof else (_parse_iso(until) if until else _utc_now())
@@ -464,8 +812,8 @@ def partial_source_health(request: Request) -> HTMLResponse:
         sources = db.conn.execute(
             """
             SELECT source_id, name, source_type, url, poll_interval_seconds,
-                   last_success_at, last_error_at, consecutive_failures,
-                   last_status_code, last_fetch_ms, last_error
+                   next_fetch_at, last_success_at, last_error_at, consecutive_failures,
+                   last_status_code, last_fetch_ms, last_error, success_count, error_count
             FROM sources
             ORDER BY name ASC;
             """
@@ -487,6 +835,8 @@ def partial_settings(request: Request) -> HTMLResponse:
     pack_states: list[dict] = []
     polling_enabled = True
     map_tile_url = settings.map_tile_url
+    x_embeds_enabled = False
+    x_scan_urls_text = ""
     with db.lock:
         row = db.conn.execute(
             "SELECT value FROM app_config WHERE key = 'polling_enabled' LIMIT 1;"
@@ -498,6 +848,23 @@ def partial_settings(request: Request) -> HTMLResponse:
         ).fetchone()
         if row is not None:
             map_tile_url = str(row["value"])
+        row = db.conn.execute(
+            "SELECT value FROM app_config WHERE key = 'x_embeds_enabled' LIMIT 1;"
+        ).fetchone()
+        if row is not None and str(row["value"]) == "1":
+            x_embeds_enabled = True
+        row = db.conn.execute(
+            "SELECT value FROM app_config WHERE key = 'x_scan_urls' LIMIT 1;"
+        ).fetchone()
+        if row is not None and row["value"]:
+            try:
+                urls = json.loads(str(row["value"]))
+                if isinstance(urls, list):
+                    x_scan_urls_text = "\n".join(
+                        str(u).strip() for u in urls if str(u).strip()
+                    )
+            except json.JSONDecodeError:
+                x_scan_urls_text = ""
 
         for pack_id in sorted(packs.keys()):
             source_ids = [e.source_id for e in packs[pack_id]]
@@ -528,6 +895,8 @@ def partial_settings(request: Request) -> HTMLResponse:
             "packs": pack_states,
             "polling_enabled": polling_enabled,
             "map_tile_url": map_tile_url,
+            "x_embeds_enabled": x_embeds_enabled,
+            "x_scan_urls_text": x_scan_urls_text,
         },
     )
 
@@ -562,6 +931,30 @@ async def post_settings(request: Request) -> HTMLResponse:
             )
         else:
             db.conn.execute("DELETE FROM app_config WHERE key = 'map_tile_url';")
+
+        x_embeds_enabled = "x_embeds_enabled" in form
+        db.conn.execute(
+            """
+            INSERT INTO app_config(key, value)
+            VALUES('x_embeds_enabled', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """,
+            ("1" if x_embeds_enabled else "0",),
+        )
+
+        urls_raw = str(form.get("x_scan_urls") or "")
+        urls = [line.strip() for line in urls_raw.splitlines() if line.strip()]
+        if urls:
+            db.conn.execute(
+                """
+                INSERT INTO app_config(key, value)
+                VALUES('x_scan_urls', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """,
+                (json.dumps(urls, ensure_ascii=False),),
+            )
+        else:
+            db.conn.execute("DELETE FROM app_config WHERE key = 'x_scan_urls';")
 
         for pack_id, entries in packs.items():
             desired_enabled = f"pack_{pack_id}" in form

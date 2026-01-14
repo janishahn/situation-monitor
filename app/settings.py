@@ -24,6 +24,17 @@ class Settings(BaseSettings):
     firms_api_key: str | None = Field(default=None, validation_alias="FIRMS_API_KEY")
     nvd_api_key: str | None = Field(default=None, validation_alias="NVD_API_KEY")
 
+    mastodon_instances: str = Field(default="", validation_alias="MASTODON_INSTANCES")
+    mastodon_tags: str = Field(
+        default="#earthquake,#wildfire,#flood,#tsunami,#storm,#breaking,#OSINT",
+        validation_alias="MASTODON_TAGS",
+    )
+
+    bluesky_handle: str | None = Field(default=None, validation_alias="BLUESKY_HANDLE")
+    bluesky_app_password: str | None = Field(
+        default=None, validation_alias="BLUESKY_APP_PASSWORD"
+    )
+
     items_retention_days: int = Field(
         default=30, validation_alias="ITEMS_RETENTION_DAYS"
     )

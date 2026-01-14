@@ -44,6 +44,7 @@ def record_fetch_success(
                 consecutive_failures = 0,
                 last_error = NULL,
                 last_error_at = NULL,
+                success_count = success_count + 1,
                 etag = ?,
                 last_modified = ?,
                 next_fetch_at = ?
@@ -97,6 +98,7 @@ def record_fetch_error(
                 last_fetch_ms = COALESCE(?, last_fetch_ms),
                 consecutive_failures = ?,
                 last_error = ?,
+                error_count = error_count + 1,
                 next_fetch_at = ?
             WHERE source_id = ?;
             """,

@@ -238,6 +238,14 @@ def _severity_score(category: str, raw: dict) -> int:
         return 50
     if category == "health_advisory":
         return 55
+    if category == "maritime_warning":
+        if raw.get("is_distress"):
+            return 85
+        if raw.get("is_hazard"):
+            return 70
+        return 60
+    if category == "social":
+        return 50
     if category == "cyber_kev":
         return 75
     if category == "cyber_cve":
@@ -288,7 +296,7 @@ def assign_item_to_incident(db: Database, item_id: str) -> ClusterResult:
         category = str(item["category"])
         item_simhash_u = _i64_to_u64(int(item["simhash"]))
         bucket = (item_simhash_u >> 48) & 0xFFFF
-        lookback_hours = 24 if category == "news" else 48
+        lookback_hours = 24 if category in {"news", "social"} else 48
         cutoff_iso = (
             (datetime.now(tz=UTC) - timedelta(hours=lookback_hours))
             .isoformat()
@@ -318,10 +326,14 @@ def assign_item_to_incident(db: Database, item_id: str) -> ClusterResult:
                 best = candidate
                 best_distance = dist
 
-        if category == "news":
+        if category in {"news", "social"}:
             match_dist = 4
             match_dist_loose = 10
             jaccard_min = 0.6
+        elif category == "maritime_warning":
+            match_dist = 6
+            match_dist_loose = 12
+            jaccard_min = 0.45
         elif category in {"earthquake", "volcano", "tsunami"}:
             match_dist = 8
             match_dist_loose = 14
@@ -573,13 +585,17 @@ def _maybe_merge_incidents(db: Database, incident_id: str) -> None:
         return
 
     category = str(incident["category"])
-    if category == "news":
+    if category in {"news", "social"}:
         max_km = 40.0
         max_dist = 2
         lookback_hours = 24
     elif category in {"earthquake", "volcano"}:
         max_km = 120.0
         max_dist = 4
+        lookback_hours = 72
+    elif category == "maritime_warning":
+        max_km = 250.0
+        max_dist = 3
         lookback_hours = 72
     elif category == "wildfire":
         max_km = 50.0

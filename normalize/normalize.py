@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import hashlib
 import json
 import re
@@ -7,6 +8,7 @@ import uuid
 from datetime import UTC, datetime
 
 from cluster.clusterer import canonicalize_url, normalize_title, simhash64
+from geo.coords_extract import extract_coords_centroid
 
 
 def _utc_now_iso() -> str:
@@ -1366,6 +1368,224 @@ def normalize_reliefweb_disaster(
         if country
         else "No country detected",
         "raw": json.dumps(record, ensure_ascii=False),
+        "hash_title": _sha256_hex(normalized_title),
+        "hash_content": _sha256_hex(content_for_hash),
+        "simhash": _u64_to_i64(sim),
+    }
+
+
+def normalize_msi_broadcast_warning(
+    *, source_id: str, record: dict, fetched_at: str
+) -> dict:
+    nav_area = str(record.get("navArea") or record.get("area") or "").strip()
+    msg_number = str(record.get("msgNumber") or record.get("number") or "").strip()
+    msg_year = str(record.get("msgYear") or record.get("year") or "").strip()
+
+    issue_date = str(record.get("issueDate") or "").strip().strip(".")
+    published_at = fetched_at
+    if issue_date:
+        try:
+            dt = datetime.strptime(issue_date, "%d%H%MZ %b %Y").replace(tzinfo=UTC)
+            published_at = dt.isoformat().replace("+00:00", "Z")
+        except ValueError:
+            published_at = fetched_at
+
+    text = str(record.get("text") or "").strip()
+    title = f"NAVAREA {nav_area} {msg_number}/{msg_year}".strip()
+    summary = text.replace("\n", " ").strip()
+    if len(summary) > 300:
+        summary = summary[:297] + "..."
+
+    coords = extract_coords_centroid(text)
+    lat = coords[0] if coords is not None else None
+    lon = coords[1] if coords is not None else None
+    confidence = "B_coords_in_text" if coords is not None else "U_unknown"
+    rationale = (
+        "Coordinates found in MSI warning text"
+        if coords is not None
+        else "MSI warning without coordinates"
+    )
+
+    raw = {
+        "nav_area": nav_area or None,
+        "msg_number": msg_number or None,
+        "msg_year": msg_year or None,
+        "subregion": record.get("subregion"),
+        "status": record.get("status"),
+        "authority": record.get("authority"),
+        "issue_date": record.get("issueDate"),
+    }
+
+    tags = ["msi", "maritime_warning"]
+    if nav_area:
+        tags.append(f"navarea:{nav_area}")
+    subregion = str(record.get("subregion") or "").strip()
+    if subregion:
+        tags.append(f"subregion:{subregion}")
+
+    lower = text.casefold()
+    if "distress" in lower or "adrift" in lower or "sinking" in lower:
+        tags.append("distress")
+        raw["is_distress"] = True
+    if "hazard" in lower or "danger" in lower:
+        tags.append("hazard")
+        raw["is_hazard"] = True
+
+    normalized_title = normalize_title(title)
+    content_for_hash = f"{normalized_title}\n{summary}".strip()
+    sim = simhash64(f"{title} {summary[:280]}")
+
+    url = canonicalize_url(
+        f"https://msi.pub.kubic.nga.mil/api/publications/broadcast-warn?output=json&navArea={nav_area}&msgNumber={msg_number}&msgYear={msg_year}"
+    )
+    external_id = f"{nav_area}-{msg_number}-{msg_year}".strip("-")
+
+    return {
+        "item_id": str(uuid.uuid4()),
+        "source_id": source_id,
+        "source_type": "json_api",
+        "external_id": external_id,
+        "url": url,
+        "title": title,
+        "summary": summary,
+        "content": text or None,
+        "published_at": published_at,
+        "updated_at": None,
+        "fetched_at": fetched_at,
+        "category": "maritime_warning",
+        "tags": json.dumps(tags, ensure_ascii=False),
+        "geom_geojson": None,
+        "lat": lat,
+        "lon": lon,
+        "location_name": f"NAVAREA {nav_area}".strip() if nav_area else None,
+        "location_confidence": confidence,
+        "location_rationale": rationale,
+        "raw": json.dumps(raw, ensure_ascii=False),
+        "hash_title": _sha256_hex(normalized_title),
+        "hash_content": _sha256_hex(content_for_hash),
+        "simhash": _u64_to_i64(sim),
+    }
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>", flags=re.UNICODE)
+_WS_RE = re.compile(r"\s+", flags=re.UNICODE)
+
+
+def normalize_mastodon_status(
+    *, source_id: str, record: dict, fetched_at: str, instance: str, tag: str
+) -> dict:
+    created_at = str(record.get("created_at") or fetched_at)
+    url = str(record.get("url") or record.get("uri") or "")
+    external_id = str(record.get("id") or url)
+
+    content_html = str(record.get("content") or "")
+    text = html.unescape(_HTML_TAG_RE.sub(" ", content_html))
+    text = _WS_RE.sub(" ", text).strip()
+
+    spoiler = str(record.get("spoiler_text") or "").strip()
+    title = spoiler or text[:140] or f"Mastodon post on {instance}"
+    summary = text[:300] + ("..." if len(text) > 300 else "")
+
+    account = record.get("account") or {}
+    acct = str(account.get("acct") or account.get("username") or "")
+
+    raw = {
+        "instance": instance,
+        "acct": acct or None,
+        "tag": tag,
+        "visibility": record.get("visibility"),
+        "replies_count": record.get("replies_count"),
+        "reblogs_count": record.get("reblogs_count"),
+        "favourites_count": record.get("favourites_count"),
+    }
+
+    tags = ["mastodon", "social", f"instance:{instance}", f"tag:{tag.lstrip('#')}"]
+    if acct:
+        tags.append(f"acct:{acct}")
+
+    normalized_title = normalize_title(title)
+    content_for_hash = f"{normalized_title}\n{summary}".strip()
+    sim = simhash64(f"{title} {summary[:280]}")
+
+    return {
+        "item_id": str(uuid.uuid4()),
+        "source_id": source_id,
+        "source_type": "social",
+        "external_id": external_id,
+        "url": canonicalize_url(url)
+        if url
+        else canonicalize_url(f"mastodon:{external_id}"),
+        "title": title,
+        "summary": summary,
+        "content": text or None,
+        "published_at": created_at,
+        "updated_at": None,
+        "fetched_at": fetched_at,
+        "category": "social",
+        "tags": json.dumps(tags, ensure_ascii=False),
+        "geom_geojson": None,
+        "lat": None,
+        "lon": None,
+        "location_name": None,
+        "location_confidence": "U_unknown",
+        "location_rationale": "Mastodon post without structured geo",
+        "raw": json.dumps(raw, ensure_ascii=False),
+        "hash_title": _sha256_hex(normalized_title),
+        "hash_content": _sha256_hex(content_for_hash),
+        "simhash": _u64_to_i64(sim),
+    }
+
+
+def normalize_bluesky_post(*, source_id: str, record: dict, fetched_at: str) -> dict:
+    uri = str(record.get("uri") or "")
+    cid = str(record.get("cid") or "")
+    author = record.get("author") or {}
+    handle = str(author.get("handle") or "")
+
+    post_record = record.get("record") or {}
+    text = str(post_record.get("text") or "").strip()
+    created_at = str(post_record.get("createdAt") or fetched_at)
+
+    rkey = ""
+    if "/app.bsky.feed.post/" in uri:
+        rkey = uri.split("/app.bsky.feed.post/", maxsplit=1)[-1].strip()
+
+    url = ""
+    if handle and rkey:
+        url = f"https://bsky.app/profile/{handle}/post/{rkey}"
+
+    title = text[:140] or f"Bluesky post by {handle or 'unknown'}"
+    summary = text[:300] + ("..." if len(text) > 300 else "")
+
+    raw = {"uri": uri, "cid": cid, "handle": handle or None}
+
+    normalized_title = normalize_title(title)
+    content_for_hash = f"{normalized_title}\n{summary}".strip()
+    sim = simhash64(f"{title} {summary[:280]}")
+
+    return {
+        "item_id": str(uuid.uuid4()),
+        "source_id": source_id,
+        "source_type": "social",
+        "external_id": uri or cid or url,
+        "url": canonicalize_url(url)
+        if url
+        else canonicalize_url(f"bluesky:{uri or cid}"),
+        "title": title,
+        "summary": summary,
+        "content": text or None,
+        "published_at": created_at,
+        "updated_at": None,
+        "fetched_at": fetched_at,
+        "category": "social",
+        "tags": json.dumps(["bluesky", "social"], ensure_ascii=False),
+        "geom_geojson": None,
+        "lat": None,
+        "lon": None,
+        "location_name": None,
+        "location_confidence": "U_unknown",
+        "location_rationale": "Bluesky post without structured geo",
+        "raw": json.dumps(raw, ensure_ascii=False),
         "hash_title": _sha256_hex(normalized_title),
         "hash_content": _sha256_hex(content_for_hash),
         "simhash": _u64_to_i64(sim),

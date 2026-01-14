@@ -10,6 +10,7 @@ dependencies = [
     "httpx>=0.28.1",
     "jinja2>=3.1.6",
     "pydantic-settings>=2.12.0",
+    "python-multipart>=0.0.21",
     "pyyaml>=6.0.3",
     "uvicorn>=0.40.0",
 ]

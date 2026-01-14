@@ -9,12 +9,15 @@ def parse_json_records(data: bytes) -> list[dict]:
         return doc
     if isinstance(doc, dict):
         for key in (
+            "broadcast-warn",
             "destinations",
             "countries",
             "items",
             "events",
             "vulnerabilities",
             "data",
+            "feed",
+            "posts",
         ):
             value = doc.get(key)
             if isinstance(value, list):

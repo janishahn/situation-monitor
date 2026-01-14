@@ -28,11 +28,31 @@
     <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 
     <script defer src="/static/app.js"></script>
+
+    <style>
+      .sm-marker {
+        background: transparent;
+        border: 0;
+      }
+      .sm-marker-label {
+        font-size: 10px;
+        font-weight: 700;
+        fill: #f8fafc;
+        text-anchor: middle;
+        dominant-baseline: middle;
+        paint-order: stroke;
+        stroke: rgba(0, 0, 0, 0.4);
+        stroke-width: 2px;
+      }
+    </style>
   </head>
   <body
     class="h-screen bg-slate-950 text-slate-100"
     x-data="{
       window: new URLSearchParams(window.location.search).get('window') || '6h',
+      cats: [],
+      q: new URLSearchParams(window.location.search).get('q') || '',
+      minSeverity: new URLSearchParams(window.location.search).get('min_severity') || '',
       nowTs: Date.now(),
       cursorTs: Date.now(),
       playing: false,
@@ -82,6 +102,8 @@
         const qs = new URLSearchParams(window.location.search)
         const win = qs.get('window')
         if (win) this.window = win
+        const cats = qs.get('categories')
+        if (cats) this.cats = cats.split(',').map(s => s.trim()).filter(Boolean)
         const asof = qs.get('asof')
         if (asof) {
           const t = Date.parse(asof)
@@ -97,6 +119,7 @@
       }
     }"
     x-init="init()"
+    @sm:set-filters.window="if($event.detail.window) window=$event.detail.window; if($event.detail.cats) cats=$event.detail.cats; if($event.detail.q !== undefined) q=$event.detail.q; if($event.detail.minSeverity !== undefined) minSeverity=$event.detail.minSeverity; $nextTick(() => { const form=document.getElementById('filters-form'); if(form) form.dispatchEvent(new Event('change',{bubbles:true})) })"
   >
     <div class="flex h-full flex-col">
       <header class="flex items-center justify-between border-b border-slate-800 px-4 py-3">
@@ -106,11 +129,20 @@
             Now:
             <span id="now-time">{{ now_iso | eu_datetime }}</span>
             <span class="ml-2 text-[11px] text-slate-500" id="now-source">
-              Atomic time (Time.now UTC)
+              Syncing...
             </span>
           </div>
         </div>
         <div class="flex items-center gap-3">
+          <div class="flex items-center gap-2">
+            <select id="saved-view-select" class="w-44 rounded bg-slate-900 px-2 py-1 text-sm">
+              <option value="">Saved view…</option>
+            </select>
+            <button id="saved-view-load" class="rounded bg-slate-800 px-2 py-1 text-sm hover:bg-slate-700">Load</button>
+            <button id="saved-view-save" class="rounded bg-slate-800 px-2 py-1 text-sm hover:bg-slate-700">Save</button>
+            <button id="saved-view-update" class="rounded bg-slate-800 px-2 py-1 text-sm hover:bg-slate-700">Update</button>
+            <button id="saved-view-delete" class="rounded bg-slate-800 px-2 py-1 text-sm hover:bg-slate-700">Delete</button>
+          </div>
           <button
             class="rounded bg-slate-800 px-3 py-1 text-sm hover:bg-slate-700"
             @click="timelineOpen = !timelineOpen; if(!timelineOpen){ playing=false; if(playTimer){clearInterval(playTimer); playTimer=null}; applyPlayback() }"
@@ -165,11 +197,12 @@
                 name="q"
                 placeholder="Search"
                 class="w-full rounded bg-slate-900 px-2 py-1 text-sm outline-none"
+                x-model="q"
               />
             </div>
-            <div class="mt-2 flex flex-wrap gap-2" x-data="{ cats: [] }">
+            <div class="mt-2 flex flex-wrap gap-2">
               <input type="hidden" name="categories" :value="cats.join(',')" />
-              <template x-for="c in ['earthquake','weather_alert','tropical_cyclone','tsunami','volcano','wildfire','aviation_disruption','health_advisory','travel_advisory','disaster','news','cyber_cve','cyber_kev']">
+              <template x-for="c in ['earthquake','weather_alert','tropical_cyclone','tsunami','volcano','wildfire','aviation_disruption','health_advisory','travel_advisory','maritime_warning','disaster','news','social','cyber_cve','cyber_kev']">
                 <button
                   type="button"
                   class="rounded border border-slate-700 px-2 py-1 text-xs hover:bg-slate-800"
@@ -187,6 +220,7 @@
                 max="100"
                 placeholder="Min severity"
                 class="w-28 rounded bg-slate-900 px-2 py-1 text-sm outline-none"
+                x-model="minSeverity"
               />
               <button type="submit" class="rounded bg-blue-600 px-3 py-1 text-sm hover:bg-blue-500">Apply</button>
             </div>
@@ -198,11 +232,51 @@
         <main class="relative flex-1">
           <div id="map" class="absolute inset-0 z-0" data-tile-url="{{ map_tile_url }}"></div>
           <section
-            id="incident-detail"
-            class="pointer-events-auto absolute right-0 top-0 z-10 h-full w-[28rem] overflow-y-auto border-l border-slate-800 bg-slate-950/95"
-            data-incident-id=""
+            id="right-panel"
+            class="pointer-events-auto absolute right-0 top-0 z-10 flex h-full w-[28rem] flex-col border-l border-slate-800 bg-slate-950/95"
+            x-data="{ tab: 'incident' }"
+            @sm:set-right-tab.window="tab = $event.detail.tab"
           >
-            <div class="p-4 text-sm text-slate-400">Select an incident.</div>
+            <div class="flex items-center justify-between border-b border-slate-800 px-3 py-2">
+              <div class="flex items-center gap-2">
+                <button class="rounded px-2 py-1 text-xs" :class="tab==='incident' ? 'bg-slate-800 text-slate-100' : 'text-slate-400 hover:text-slate-200'" @click="tab='incident'">Incident</button>
+                <button class="rounded px-2 py-1 text-xs" :class="tab==='x' ? 'bg-slate-800 text-slate-100' : 'text-slate-400 hover:text-slate-200'" @click="tab='x'; if(window.SM) window.SM.openXScan()">X Scan</button>
+              </div>
+            </div>
+
+            <div id="incident-detail-content" class="flex-1 overflow-y-auto" data-incident-id="">
+              <div class="p-4 text-sm text-slate-400">Select an incident.</div>
+            </div>
+
+            <div
+              id="x-scan-panel"
+              class="flex-1 overflow-y-auto p-4"
+              x-show="tab==='x'"
+              x-transition
+              data-x-enabled="{{ '1' if x_embeds_enabled else '0' }}"
+              data-x-urls='{{ x_scan_urls_json }}'
+            >
+              <div class="rounded border border-slate-800 bg-slate-900/60 p-3 text-xs text-slate-300">
+                X embeds may load third-party content and enable tracking.
+                <button class="ml-2 text-blue-400 hover:text-blue-300" onclick="document.getElementById('modal-title').textContent='Settings'; document.getElementById('modal').classList.remove('hidden'); if(window.htmx){ window.htmx.ajax('GET','/partials/settings',{target:'#modal-content',swap:'innerHTML'}) }">
+                  Settings
+                </button>
+              </div>
+
+              {% if not x_embeds_enabled %}
+              <div class="mt-3 text-sm text-slate-400">X embeds are disabled. Enable in Settings and refresh the page.</div>
+              {% endif %}
+
+              {% if x_scan_urls %}
+              <div class="mt-4 space-y-4">
+                {% for url in x_scan_urls %}
+                <a class="twitter-timeline" data-theme="dark" data-chrome="noheader nofooter" href="{{ url }}">X</a>
+                {% endfor %}
+              </div>
+              {% else %}
+              <div class="mt-4 text-sm text-slate-400">Add list/search URLs in Settings → X Scan.</div>
+              {% endif %}
+            </div>
           </section>
         </main>
       </div>
@@ -227,7 +301,7 @@
           <button class="rounded bg-slate-800 px-2 py-1 hover:bg-slate-700" @click="step(stepMs)">+5m</button>
           <div class="ml-2 text-slate-400">
             Cursor:
-            <span x-text="new Date(cursorTs).toISOString()"></span>
+            <span x-text="window.SM?.formatEuDateTime ? window.SM.formatEuDateTime(new Date(cursorTs)) : new Date(cursorTs).toLocaleString()"></span>
             <span class="ml-2 rounded bg-slate-800 px-2 py-0.5 text-[11px]" x-text="playback ? 'playback' : 'live'"></span>
           </div>
         </div>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,8 +17,10 @@ from cluster.clusterer import ClusterResult, assign_item_to_incident
 from geo.gazetteer import (
     find_country_centroid,
     match_country_in_text,
+    match_place_in_text,
     normalize_place_name,
 )
+from geo.coords_extract import extract_coords_centroid
 from geo.airports import load_airports_by_iata
 from health.health import record_fetch_error, record_fetch_success
 from ingest.fetch import cache_control_max_age_seconds, fetch
@@ -41,10 +44,13 @@ from normalize.normalize import (
     normalize_govuk_travel_advice,
     normalize_hans_elevated_notice,
     normalize_hans_volcano_rss_item,
+    normalize_mastodon_status,
+    normalize_msi_broadcast_warning,
     normalize_generic_rss,
     normalize_nhc_item,
     normalize_nvd_cve,
     normalize_nws_alert,
+    normalize_bluesky_post,
     normalize_reliefweb_report,
     normalize_reliefweb_disaster,
     normalize_smartraveller_export,
@@ -554,6 +560,136 @@ def phase2_sources(settings: Settings) -> list[SourcePlugin]:
     ]
 
 
+def phase3_sources(settings: Settings) -> list[SourcePlugin]:
+    def msi_build_url(db: Database, fetched_at: str) -> str:
+        base_url = "https://msi.pub.kubic.nga.mil"
+        with db.lock:
+            row = db.conn.execute(
+                "SELECT value FROM app_config WHERE key = 'msi_api_base_url' LIMIT 1;"
+            ).fetchone()
+        if row is not None:
+            base_url = str(row["value"]).rstrip("/")
+        return f"{base_url}/api/publications/broadcast-warn?output=json&status=current"
+
+    sources: list[SourcePlugin] = [
+        SourcePlugin(
+            source_id="msi_navwarn_current",
+            name="NGA MSI Broadcast Warnings (Current)",
+            url="https://msi.pub.kubic.nga.mil/api/publications/broadcast-warn?output=json&status=current",
+            source_type="json_api",
+            poll_interval_seconds=900,
+            build_url=msi_build_url,
+            parse=parse_json_records,
+            normalize=lambda r, fetched_at: normalize_msi_broadcast_warning(
+                source_id="msi_navwarn_current", record=r, fetched_at=fetched_at
+            ),
+        )
+    ]
+
+    for subreddit in (
+        "worldnews",
+        "geopolitics",
+        "Cybersecurity",
+        "osint",
+        "news",
+    ):
+        sources.append(
+            SourcePlugin(
+                source_id=f"reddit_{subreddit.casefold()}",
+                name=f"Reddit RSS /r/{subreddit}",
+                url=f"https://www.reddit.com/r/{subreddit}/.rss",
+                source_type="rss",
+                poll_interval_seconds=240,
+                headers={"User-Agent": f"{settings.user_agent} (reddit rss)"},
+                parse=parse_rss,
+                normalize=lambda r,
+                fetched_at,
+                subreddit=subreddit: normalize_generic_rss(
+                    source_id=f"reddit_{subreddit.casefold()}",
+                    record=r,
+                    fetched_at=fetched_at,
+                    category="social",
+                    tags=["reddit", f"r:{subreddit.casefold()}"],
+                ),
+            )
+        )
+
+    instances = [p.strip() for p in settings.mastodon_instances.split(",") if p.strip()]
+    tags = [t.strip() for t in settings.mastodon_tags.split(",") if t.strip()]
+    for instance in instances:
+        token_key = "MASTODON_TOKEN_" + instance.upper().replace(".", "_").replace(
+            "-", "_"
+        ).replace(":", "_")
+        token = os.environ.get(token_key)
+        headers = {"Authorization": f"Bearer {token}"} if token else None
+
+        for tag in tags:
+            tag_slug = tag.lstrip("#").casefold()
+            source_id = f"mastodon_{instance.casefold().replace('.', '_').replace('-', '_')}_{tag_slug}"
+
+            def build_url(
+                db: Database,
+                fetched_at: str,
+                *,
+                instance=instance,
+                tag_slug=tag_slug,
+                source_id=source_id,
+            ) -> str:
+                base = f"https://{instance}/api/v1/timelines/tag/{tag_slug}"
+                params: dict[str, str] = {"limit": "20"}
+                with db.lock:
+                    row = db.conn.execute(
+                        "SELECT cursor FROM sources WHERE source_id = ? LIMIT 1;",
+                        (source_id,),
+                    ).fetchone()
+                if row is not None and row["cursor"]:
+                    params["since_id"] = str(row["cursor"])
+                return f"{base}?{urlencode(params)}"
+
+            sources.append(
+                SourcePlugin(
+                    source_id=source_id,
+                    name=f"Mastodon #{tag_slug} ({instance})",
+                    url=f"https://{instance}/api/v1/timelines/tag/{tag_slug}?limit=20",
+                    source_type="social",
+                    poll_interval_seconds=180,
+                    headers=headers,
+                    build_url=build_url,
+                    parse=parse_json_records,
+                    normalize=lambda r,
+                    fetched_at,
+                    instance=instance,
+                    tag=tag,
+                    source_id=source_id: normalize_mastodon_status(
+                        source_id=source_id,
+                        record=r,
+                        fetched_at=fetched_at,
+                        instance=instance,
+                        tag=tag,
+                    ),
+                    default_enabled=False,
+                )
+            )
+
+    if settings.bluesky_handle and settings.bluesky_app_password:
+        sources.append(
+            SourcePlugin(
+                source_id="bluesky_search_breaking",
+                name="Bluesky Search (breaking)",
+                url="https://bsky.social/xrpc/app.bsky.feed.searchPosts?q=breaking&limit=30",
+                source_type="social",
+                poll_interval_seconds=300,
+                parse=parse_json_records,
+                normalize=lambda r, fetched_at: normalize_bluesky_post(
+                    source_id="bluesky_search_breaking", record=r, fetched_at=fetched_at
+                ),
+                default_enabled=False,
+            )
+        )
+
+    return sources
+
+
 def ensure_sources(db: Database, plugins: list[SourcePlugin]) -> None:
     now_iso = _utc_now_iso()
     with db.lock:
@@ -623,9 +759,97 @@ def feed_pack_sources(feeds_dir: Path) -> list[SourcePlugin]:
     return sources
 
 
+async def _ensure_msi_openapi(
+    client: httpx.AsyncClient, db: Database, user_agent: str
+) -> None:
+    with db.lock:
+        row = db.conn.execute(
+            "SELECT value FROM app_config WHERE key = 'msi_openapi_url' LIMIT 1;"
+        ).fetchone()
+        if row is not None:
+            return
+
+    candidates = [
+        "https://msi.nga.mil/v2/api-docs",
+        "https://msi.nga.mil/v3/api-docs",
+        "https://msi.nga.mil/openapi.json",
+        "https://msi.pub.kubic.nga.mil/v2/api-docs",
+        "https://msi.pub.kubic.nga.mil/v3/api-docs",
+        "https://msi.pub.kubic.nga.mil/openapi.json",
+    ]
+
+    for url in candidates:
+        try:
+            res = await client.get(
+                url,
+                headers={"User-Agent": user_agent, "Accept": "application/json"},
+                timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
+            )
+        except httpx.TimeoutException:
+            continue
+        except httpx.RequestError:
+            continue
+
+        if res.status_code != 200:
+            continue
+
+        try:
+            spec = res.json()
+        except json.JSONDecodeError:
+            continue
+
+        base_url = None
+        if spec.get("swagger") == "2.0":
+            host = str(spec.get("host") or "").strip()
+            base_path = str(spec.get("basePath") or "").strip()
+            if host:
+                base_url = f"https://{host}{base_path}".rstrip("/")
+        elif spec.get("openapi"):
+            servers = spec.get("servers") or []
+            if servers and isinstance(servers, list) and isinstance(servers[0], dict):
+                base_url = str(servers[0].get("url") or "").rstrip("/")
+
+        if not base_url:
+            continue
+
+        now_iso = _utc_now_iso()
+        with db.lock:
+            db.conn.execute(
+                """
+                INSERT INTO app_config(key, value)
+                VALUES('msi_openapi_url', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """,
+                (url,),
+            )
+            db.conn.execute(
+                """
+                INSERT INTO app_config(key, value)
+                VALUES('msi_api_base_url', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """,
+                (base_url,),
+            )
+            db.conn.execute(
+                """
+                INSERT INTO app_config(key, value)
+                VALUES('msi_openapi_fetched_at', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """,
+                (now_iso,),
+            )
+            db.conn.commit()
+        return
+
+
 async def run_scheduler(*, settings: Settings, db: Database, bus: EventBus) -> None:
     feeds_dir = Path(__file__).resolve().parents[1] / "feeds"
-    plugins = phase1_sources() + phase2_sources(settings) + feed_pack_sources(feeds_dir)
+    plugins = (
+        phase1_sources()
+        + phase2_sources(settings)
+        + phase3_sources(settings)
+        + feed_pack_sources(feeds_dir)
+    )
     plugin_by_id = {p.source_id: p for p in plugins}
     ensure_sources(db, plugins)
 
@@ -635,6 +859,7 @@ async def run_scheduler(*, settings: Settings, db: Database, bus: EventBus) -> N
     next_cleanup_at = datetime.now(tz=UTC) + timedelta(minutes=10)
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
+        await _ensure_msi_openapi(client, db, settings.user_agent)
         while True:
             now_iso = _utc_now_iso()
             polling_enabled = True
@@ -680,7 +905,7 @@ async def run_scheduler(*, settings: Settings, db: Database, bus: EventBus) -> N
                                 bus,
                                 plugin_by_id,
                                 plugins_lock,
-                                settings.user_agent,
+                                settings,
                                 global_sem,
                                 host_sem,
                                 str(row["etag"]) if row["etag"] is not None else None,
@@ -706,7 +931,7 @@ async def _run_one(
     bus: EventBus,
     plugin_by_id: dict[str, SourcePlugin],
     plugins_lock: asyncio.Lock,
-    user_agent: str,
+    settings: Settings,
     global_sem: asyncio.Semaphore,
     host_sem: asyncio.Semaphore,
     etag: str | None,
@@ -716,6 +941,103 @@ async def _run_one(
     async with global_sem, host_sem:
         fetched_at = _utc_now_iso()
         url = plugin.build_url(db, fetched_at) if plugin.build_url else plugin.url
+        user_agent = settings.user_agent
+        extra_headers = plugin.headers
+
+        if (
+            plugin.source_id.startswith("bluesky_")
+            and settings.bluesky_handle
+            and settings.bluesky_app_password
+        ):
+            try:
+                res = await client.post(
+                    "https://bsky.social/xrpc/com.atproto.server.createSession",
+                    json={
+                        "identifier": settings.bluesky_handle,
+                        "password": settings.bluesky_app_password,
+                    },
+                    headers={"User-Agent": user_agent, "Accept": "application/json"},
+                    timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
+                )
+            except httpx.TimeoutException:
+                backoff = record_fetch_error(
+                    db,
+                    source_id=plugin.source_id,
+                    status_code=None,
+                    fetch_ms=None,
+                    error="bluesky_auth_timeout",
+                )
+                await bus.publish(
+                    Event(
+                        type="source.health",
+                        data={"source_id": plugin.source_id, "backoff": backoff},
+                    )
+                )
+                return
+            except httpx.RequestError as e:
+                backoff = record_fetch_error(
+                    db,
+                    source_id=plugin.source_id,
+                    status_code=None,
+                    fetch_ms=None,
+                    error=f"bluesky_auth_error:{e.__class__.__name__}",
+                )
+                await bus.publish(
+                    Event(
+                        type="source.health",
+                        data={"source_id": plugin.source_id, "backoff": backoff},
+                    )
+                )
+                return
+
+            if res.status_code != 200:
+                backoff = record_fetch_error(
+                    db,
+                    source_id=plugin.source_id,
+                    status_code=res.status_code,
+                    fetch_ms=None,
+                    error=f"bluesky_auth_http_{res.status_code}",
+                )
+                await bus.publish(
+                    Event(
+                        type="source.health",
+                        data={
+                            "source_id": plugin.source_id,
+                            "status": res.status_code,
+                            "backoff": backoff,
+                        },
+                    )
+                )
+                return
+
+            try:
+                session = res.json()
+            except json.JSONDecodeError:
+                backoff = record_fetch_error(
+                    db,
+                    source_id=plugin.source_id,
+                    status_code=res.status_code,
+                    fetch_ms=None,
+                    error="bluesky_auth_parse_error",
+                )
+                await bus.publish(
+                    Event(
+                        type="source.health",
+                        data={
+                            "source_id": plugin.source_id,
+                            "status": res.status_code,
+                            "backoff": backoff,
+                        },
+                    )
+                )
+                return
+
+            token = str(session.get("accessJwt") or "").strip()
+            if token:
+                extra_headers = {
+                    **(plugin.headers or {}),
+                    "Authorization": f"Bearer {token}",
+                }
         try:
             status_code, content, headers, elapsed_ms = await fetch(
                 client,
@@ -723,7 +1045,7 @@ async def _run_one(
                 user_agent=user_agent,
                 etag=etag,
                 last_modified=last_modified,
-                extra_headers=plugin.headers,
+                extra_headers=extra_headers,
             )
         except httpx.TimeoutException:
             backoff = record_fetch_error(
@@ -780,6 +1102,43 @@ async def _run_one(
             return
 
         if status_code != 200 or content is None:
+            if status_code == 429:
+                backoff = record_fetch_error(
+                    db,
+                    source_id=plugin.source_id,
+                    status_code=status_code,
+                    fetch_ms=elapsed_ms,
+                    error="http_429",
+                )
+                retry_after = headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    retry_seconds = int(retry_after)
+                    if retry_seconds > backoff:
+                        next_iso = (
+                            (datetime.now(tz=UTC) + timedelta(seconds=retry_seconds))
+                            .isoformat()
+                            .replace("+00:00", "Z")
+                        )
+                        with db.lock:
+                            db.conn.execute(
+                                "UPDATE sources SET next_fetch_at = ? WHERE source_id = ?;",
+                                (next_iso, plugin.source_id),
+                            )
+                            db.conn.commit()
+                        backoff = retry_seconds
+
+                await bus.publish(
+                    Event(
+                        type="source.health",
+                        data={
+                            "source_id": plugin.source_id,
+                            "status": status_code,
+                            "backoff": backoff,
+                        },
+                    )
+                )
+                return
+
             backoff = record_fetch_error(
                 db,
                 source_id=plugin.source_id,
@@ -820,6 +1179,10 @@ async def _run_one(
                 )
             )
             return
+
+        mastodon_cursor_out = None
+        if plugin.source_id.startswith("mastodon_") and records:
+            mastodon_cursor_out = str(max(int(r["id"]) for r in records))
 
         if plugin.source_id == "hans_elevated_volcanoes":
             volcanoes: dict[str, str] = {}
@@ -918,23 +1281,22 @@ async def _run_one(
 
         with db.lock:
             countries: list[tuple[str, str, float, float]] = []
-            if plugin.source_type == "rss":
-                country_rows = db.conn.execute(
-                    """
-                    SELECT name, normalized_name, lat, lon
-                    FROM places
-                    WHERE kind = 'country' AND lat IS NOT NULL AND lon IS NOT NULL;
-                    """
-                ).fetchall()
-                countries = [
-                    (
-                        str(r["name"]),
-                        str(r["normalized_name"]),
-                        float(r["lat"]),
-                        float(r["lon"]),
-                    )
-                    for r in country_rows
-                ]
+            country_rows = db.conn.execute(
+                """
+                SELECT name, normalized_name, lat, lon
+                FROM places
+                WHERE kind = 'country' AND lat IS NOT NULL AND lon IS NOT NULL;
+                """
+            ).fetchall()
+            countries = [
+                (
+                    str(r["name"]),
+                    str(r["normalized_name"]),
+                    float(r["lat"]),
+                    float(r["lon"]),
+                )
+                for r in country_rows
+            ]
 
             for record in records:
                 item = plugin.normalize(record, fetched_at)
@@ -943,21 +1305,63 @@ async def _run_one(
                 item["external_id"] = external_id
 
                 if (
-                    item["category"] == "news"
-                    and item["location_confidence"] == "U_unknown"
-                    and countries
+                    item["category"] in {"news", "social", "maritime_warning"}
+                    and item.get("geom_geojson") is None
+                    and item.get("lat") is None
+                    and item.get("lon") is None
                 ):
-                    match = match_country_in_text(
-                        countries,
-                        f"{item['title']} {item['summary']}",
+                    text_for_geo = f"{item['title']} {item['summary']} {item.get('content') or ''}".strip()
+                    coords_hint = extract_coords_centroid(text_for_geo)
+                    country_match = (
+                        match_country_in_text(countries, text_for_geo)
+                        if countries
+                        else None
                     )
-                    if match is not None:
-                        name, lat, lon = match
-                        item["location_name"] = name
-                        item["location_confidence"] = "C_country"
-                        item["location_rationale"] = "Country mentioned in RSS text"
-                        item["lat"] = lat
-                        item["lon"] = lon
+                    country_code_hint = None
+                    if country_match is not None:
+                        country_norm = normalize_place_name(country_match[0])
+                        row = db.conn.execute(
+                            """
+                            SELECT country_code
+                            FROM places
+                            WHERE kind = 'country' AND normalized_name = ?
+                            LIMIT 1;
+                            """,
+                            (country_norm,),
+                        ).fetchone()
+                        if row is not None and row["country_code"]:
+                            country_code_hint = str(row["country_code"])
+
+                    place = match_place_in_text(
+                        db,
+                        text_for_geo,
+                        coords_hint=coords_hint,
+                        country_code_hint=country_code_hint,
+                    )
+
+                    conf = str(item.get("location_confidence") or "U_unknown")
+                    if conf == "U_unknown" or conf.startswith("C_"):
+                        if coords_hint is not None:
+                            item["lat"], item["lon"] = coords_hint
+                            item["location_confidence"] = "B_coords_in_text"
+                            item["location_rationale"] = "Coordinates found in text"
+                            if place is not None and not item.get("location_name"):
+                                item["location_name"] = str(place["name"])
+                        elif place is not None:
+                            item["lat"] = float(place["lat"])
+                            item["lon"] = float(place["lon"])
+                            item["location_name"] = str(place["name"])
+                            item["location_confidence"] = "B_place_match"
+                            item["location_rationale"] = (
+                                f"Gazetteer match: {place['name']}"
+                            )
+                        elif country_match is not None and conf == "U_unknown":
+                            name, lat, lon = country_match
+                            item["location_name"] = name
+                            item["location_confidence"] = "C_country"
+                            item["location_rationale"] = "Country detected in text"
+                            item["lat"] = lat
+                            item["lon"] = lon
 
                 if (
                     item["source_id"] == "smartraveller_export"
@@ -1015,20 +1419,33 @@ async def _run_one(
                     and item.get("location_name")
                 ):
                     centroid = find_country_centroid(db, str(item["location_name"]))
-                    if centroid is not None:
-                        item["lat"], item["lon"] = centroid
+                if centroid is not None:
+                    item["lat"], item["lon"] = centroid
 
-                exists = db.conn.execute(
-                    """
-                    SELECT 1
-                    FROM items
-                    WHERE source_id = ?
-                      AND hash_title = ?
-                      AND published_at >= ?
-                    LIMIT 1;
-                    """,
-                    (item["source_id"], item["hash_title"], title_cutoff),
-                ).fetchone()
+                exists = None
+                if item["category"] == "news" and item.get("external_id"):
+                    exists = db.conn.execute(
+                        """
+                        SELECT 1
+                        FROM items
+                        WHERE source_id = ?
+                          AND external_id = ?
+                        LIMIT 1;
+                        """,
+                        (item["source_id"], item["external_id"]),
+                    ).fetchone()
+                else:
+                    exists = db.conn.execute(
+                        """
+                        SELECT 1
+                        FROM items
+                        WHERE source_id = ?
+                          AND hash_title = ?
+                          AND published_at >= ?
+                        LIMIT 1;
+                        """,
+                        (item["source_id"], item["hash_title"], title_cutoff),
+                    ).fetchone()
                 if exists is not None:
                     continue
 
@@ -1053,6 +1470,12 @@ async def _run_one(
                 except sqlite3.IntegrityError:
                     continue
                 inserted.append(str(item["item_id"]))
+
+            if mastodon_cursor_out is not None:
+                db.conn.execute(
+                    "UPDATE sources SET cursor = ? WHERE source_id = ?;",
+                    (mastodon_cursor_out, plugin.source_id),
+                )
 
             db.conn.commit()
 
