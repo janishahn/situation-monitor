@@ -38,7 +38,6 @@
       playing: false,
       playTimer: null,
       timelineOpen: false,
-      cyberOpen: true,
       stepMs: 5 * 60 * 1000,
       get windowMs() {
         if (this.window === '1h') return 60 * 60 * 1000
@@ -194,27 +193,6 @@
           </form>
 
           <div id="incident-list" class="flex-1 overflow-y-auto"></div>
-
-          <div class="border-t border-slate-800">
-            <div class="flex items-center justify-between px-3 py-2">
-              <div class="text-xs font-semibold text-slate-300">Cyber</div>
-              <button
-                type="button"
-                class="text-xs text-slate-400 hover:text-slate-200"
-                @click="cyberOpen = !cyberOpen"
-                x-text="cyberOpen ? 'Hide' : 'Show'"
-              ></button>
-            </div>
-            <div
-              id="cyber-list"
-              class="max-h-56 overflow-y-auto"
-              x-show="cyberOpen"
-              x-transition
-              hx-get="/partials/cyber"
-              hx-trigger="load"
-              hx-swap="innerHTML"
-            ></div>
-          </div>
         </aside>
 
         <main class="relative flex-1">

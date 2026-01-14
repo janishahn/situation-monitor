@@ -414,33 +414,6 @@ def partial_incidents(
     )
 
 
-@app.get("/partials/cyber", response_class=HTMLResponse)
-def partial_cyber(
-    request: Request,
-    window: str = Query(default="7d", pattern="^(1h|6h|24h|7d)$"),
-) -> HTMLResponse:
-    db: Database = request.app.state.db
-    until_dt = _utc_now()
-    since_dt = _time_window_to_since(window, until_dt)
-
-    incidents = _query_incidents(
-        db,
-        since_iso=since_dt.isoformat().replace("+00:00", "Z"),
-        until_iso=until_dt.isoformat().replace("+00:00", "Z"),
-        asof_iso=None,
-        categories=["cyber_cve", "cyber_kev"],
-        bbox=None,
-        q=None,
-        min_severity=None,
-        limit=200,
-    )
-    return templates.TemplateResponse(
-        request=request,
-        name="partials/cyber.html",
-        context={"incidents": incidents},
-    )
-
-
 @app.get("/partials/incident/{incident_id}", response_class=HTMLResponse)
 def partial_incident_detail(request: Request, incident_id: str) -> HTMLResponse:
     db: Database = request.app.state.db

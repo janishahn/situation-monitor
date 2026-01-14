@@ -109,11 +109,6 @@
     window.htmx.ajax("GET", "/partials/incidents" + qs(), { target: "#incident-list", swap: "innerHTML" });
   }
 
-  function refreshCyberPanel() {
-    if (!window.htmx) return;
-    window.htmx.ajax("GET", "/partials/cyber", { target: "#cyber-list", swap: "innerHTML" });
-  }
-
   function pad2(value) {
     return String(value).padStart(2, "0");
   }
@@ -175,7 +170,6 @@
         const data = JSON.parse(ev.data);
         upsertMarker(data);
         refreshIncidentsPanel();
-        if ((data.category || "").startsWith("cyber_")) refreshCyberPanel();
         const activeId = document.getElementById("incident-detail")?.dataset?.incidentId;
         if (activeId && activeId === data.incident_id) {
           window.htmx.ajax("GET", `/partials/incident/${activeId}`, { target: "#incident-detail", swap: "innerHTML" });
