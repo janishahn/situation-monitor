@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0" xmlns:georss="http://www.georss.org/georss">
+  <channel>
+    <title>NHC Example</title>
+    <item>
+      <guid>nhc-1</guid>
+      <title>Storm Advisory</title>
+      <link>https://www.nhc.noaa.gov/</link>
+      <description>Example advisory text.</description>
+      <pubDate>Wed, 14 Jan 2026 18:00:00 GMT</pubDate>
+      <georss:point>25.0 -70.0</georss:point>
+    </item>
+  </channel>
+</rss>
+

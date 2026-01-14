@@ -1,0 +1,19 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "us123",
+      "properties": {
+        "mag": 4.8,
+        "place": "10 km NW of Testville",
+        "time": 1700000000000,
+        "updated": 1700000005000,
+        "url": "https://earthquake.usgs.gov/earthquakes/eventpage/us123",
+        "title": "M 4.8 - 10 km NW of Testville"
+      },
+      "geometry": { "type": "Point", "coordinates": [139.7, 35.7, 10.0] }
+    }
+  ]
+}
+

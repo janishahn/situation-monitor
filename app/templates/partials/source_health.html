@@ -1,0 +1,32 @@
+<div class="max-h-[32rem] overflow-y-auto">
+  <table class="w-full table-fixed text-left text-xs">
+    <thead class="sticky top-0 bg-slate-950">
+      <tr class="border-b border-slate-800 text-slate-400">
+        <th class="w-48 py-2">Source</th>
+        <th class="w-24 py-2">Type</th>
+        <th class="w-24 py-2">OK</th>
+        <th class="w-24 py-2">Err</th>
+        <th class="w-20 py-2">Fail</th>
+        <th class="w-20 py-2">Status</th>
+        <th class="w-24 py-2">ms</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in sources %}
+      <tr class="border-b border-slate-900">
+        <td class="py-2 pr-2">
+          <div class="truncate text-slate-200">{{ s.name }}</div>
+          <div class="truncate text-[11px] text-slate-500">{{ s.source_id }}</div>
+        </td>
+        <td class="py-2 text-slate-300">{{ s.source_type }}</td>
+        <td class="py-2 text-slate-300">{{ s.last_success_at or '-' }}</td>
+        <td class="py-2 text-slate-300">{{ s.last_error_at or '-' }}</td>
+        <td class="py-2 text-slate-300">{{ s.consecutive_failures }}</td>
+        <td class="py-2 text-slate-300">{{ s.last_status_code or '-' }}</td>
+        <td class="py-2 text-slate-300">{{ s.last_fetch_ms or '-' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+

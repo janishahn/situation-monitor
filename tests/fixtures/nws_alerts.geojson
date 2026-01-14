@@ -1,0 +1,28 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "https://api.weather.gov/alerts/urn:oid:2.49.0.1.840.0.test",
+      "properties": {
+        "event": "Tornado Warning",
+        "headline": "Tornado Warning issued November 14 at 3:00PM",
+        "description": "A tornado has been spotted.",
+        "instruction": "Take shelter now.",
+        "severity": "Severe",
+        "urgency": "Immediate",
+        "certainty": "Observed",
+        "effective": "2026-01-14T18:00:00Z",
+        "onset": "2026-01-14T18:00:00Z",
+        "expires": "2026-01-14T19:00:00Z",
+        "ends": "2026-01-14T19:00:00Z",
+        "areaDesc": "Test County"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[ -97.0, 35.0 ], [ -97.0, 35.2 ], [ -96.8, 35.2 ], [ -96.8, 35.0 ], [ -97.0, 35.0 ]]]
+      }
+    }
+  ]
+}
+

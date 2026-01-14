@@ -1,0 +1,1 @@
+"""Situation Monitor application package."""
